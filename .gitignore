@@ -1,0 +1,99 @@
+# ═══════════════════════════════════════════════════════════════════════════
+#  Dependencies
+# ═══════════════════════════════════════════════════════════════════════════
+node_modules/
+.pnp
+.pnp.js
+.yarn/*
+!.yarn/patches
+!.yarn/releases
+!.yarn/plugins
+!.yarn/versions
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Build output
+#  `.next` and `tsconfig.tsbuildinfo` were once committed here. gitignore does
+#  not untrack anything, so they had to be removed from the index by hand.
+#  Do not let them back in — a committed build directory bloats the clone and
+#  can shadow a fresh build on CI.
+# ═══════════════════════════════════════════════════════════════════════════
+.next/
+out/
+build/
+dist/
+*.tsbuildinfo
+next-env.d.ts
+.turbo/
+.nuxt/
+.svelte-kit/
+.vercel/
+*.tsbuildinfo
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Secrets
+#  `.env.local` was committed once. It held nothing at the time, but the next
+#  person to paste a real key into it and commit would publish that key.
+#  Only the template is tracked; everything else is ignored.
+# ═══════════════════════════════════════════════════════════════════════════
+.env
+.env.*
+!.env.example
+!.env.template
+*.pem
+*.key
+*.p12
+*.pfx
+credentials.json
+service-account*.json
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Logs
+# ═══════════════════════════════════════════════════════════════════════════
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Tests and coverage
+# ═══════════════════════════════════════════════════════════════════════════
+coverage/
+.nyc_output/
+test-results/
+playwright-report/
+blob-report/
+.playwright/
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Supabase CLI scratch space
+#  `.temp` holds a link token for a real project. Never commit it.
+# ═══════════════════════════════════════════════════════════════════════════
+supabase/.temp/
+supabase/.branches/
+supabase/.env
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Editors and OS
+# ═══════════════════════════════════════════════════════════════════════════
+.vscode/
+.idea/
+.vs/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+ehthumbs.db
+Desktop.ini
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Caches
+# ═══════════════════════════════════════════════════════════════════════════
+.cache/
+.parcel-cache/
+.eslintcache
+.stylelintcache
