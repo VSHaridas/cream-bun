@@ -20,6 +20,7 @@ const COLUMNS = [
       { href: "/trust#digilocker", label: "DigiLocker identity" },
       { href: "/trust#razorpay", label: "Held payments" },
       { href: "/trust#provenance", label: "Provenance & watermark" },
+      { href: "/onboarding", label: "Set up your profile" },
       { href: "/onboarding/identity", label: "Verify your account" },
     ],
   },

@@ -15,6 +15,17 @@ import { COOKIE_DOMAIN, supabase as supabaseEnv } from "@/lib/env";
  * built-ins and of any import from the server client.
  */
 
+/**
+ * True when the thrown error means "there was no cookie", rather than a fault.
+ *
+ * `getUser()` raises `AuthSessionMissingError` for a request with no session.
+ * That is the expected state for an anonymous visitor, so treating it as an
+ * error logged one line per page view and buried the real failures.
+ */
+function isNoSession(message: string) {
+  return /auth session missing|AuthSessionMissingError|no session/i.test(message);
+}
+
 const PUBLIC_ROUTES = [
   "/",
   "/discover",
@@ -105,19 +116,23 @@ async function handle(request: NextRequest) {
     },
   });
 
-  // Touching the user refreshes the token when it is near expiry. A network
-  // failure here must not be fatal either — an unreachable identity provider
-  // should degrade to "nobody is signed in", not to a blank site.
+  // Touching the user refreshes the token when it is near expiry.
+  //
+  // "Auth session missing!" is not a failure. It is what getUser() returns when
+  // the request simply carries no session cookie, which is the normal state for
+  // every anonymous visitor and for every asset request. Logging it as an error
+  // put a red line in the deploy log for each page view and buried the two
+  // errors that did matter. Only a genuine fault is worth a line.
   let user = null;
   try {
     const { data, error } = await supabase.auth.getUser();
     if (error) throw error;
     user = data.user;
   } catch (error) {
-    console.error(
-      "[cream] session lookup failed, treating the request as anonymous:",
-      error instanceof Error ? error.message : error,
-    );
+    const message = error instanceof Error ? error.message : String(error);
+    if (!isNoSession(message)) {
+      console.error("[cream] session lookup failed, treating the request as anonymous:", message);
+    }
   }
 
   const isPublic = matchesPublic(pathname);

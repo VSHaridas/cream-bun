@@ -14,13 +14,21 @@ import { APP_URL } from "@/lib/env";
  * is reachable by anyone who can trigger an OAuth callback.
  */
 
-const ALLOWED_PREFIXES = ["/", "/briefs", "/engagements", "/onboarding", "/discover", "/deck"];
+const ALLOWED_PREFIXES = [
+  "/",
+  "/briefs",
+  "/engagements",
+  "/onboarding",
+  "/discover",
+  "/deck",
+  "/trust",
+];
 
 function safeNext(value: string | null) {
-  if (!value) return "/";
-  if (!value.startsWith("/")) return "/";
-  if (value.startsWith("//")) return "/";
-  return ALLOWED_PREFIXES.some((p) => value === p || value.startsWith(`${p}/`)) ? value : "/";
+  if (!value) return null;
+  if (!value.startsWith("/")) return null;
+  if (value.startsWith("//")) return null;
+  return ALLOWED_PREFIXES.some((p) => value === p || value.startsWith(`${p}/`)) ? value : null;
 }
 
 export async function GET(request: Request) {
@@ -53,5 +61,30 @@ export async function GET(request: Request) {
     return NextResponse.redirect(target);
   }
 
-  return NextResponse.redirect(new URL(safeNext(nextParam), origin));
+  const destination = safeNext(nextParam) ?? (await onboardingPath());
+  return NextResponse.redirect(new URL(destination, origin));
+}
+
+/**
+ * Decides where a user lands when they did not ask for a specific page.
+ *
+ * `handle_new_user()` writes a profile and a stub creator/brand row on first
+ * sign-in, so a new account looks complete to anything that only checks for
+ * existence. Reading the shape rather than the presence is what makes
+ * onboarding reachable at all.
+ */
+async function onboardingPath() {
+  try {
+    const { postSignInPath } = await import("@/lib/identity/onboarding-state");
+    return await postSignInPath("/");
+  } catch (error) {
+    // Onboarding routing is a convenience, not an authorisation boundary. If
+    // the state query fails the user should still get a working session rather
+    // than an error page.
+    console.error(
+      "[cream] could not resolve post-sign-in destination:",
+      error instanceof Error ? error.message : error,
+    );
+    return "/";
+  }
 }

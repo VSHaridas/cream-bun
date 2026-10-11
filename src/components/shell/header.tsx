@@ -103,18 +103,29 @@ export function Header({
 
           {authOn &&
             (user ? (
-              <form action="/auth/signout" method="post" className="hidden sm:block">
-                <button
-                  type="submit"
-                  title={user.email ?? undefined}
-                  className="inline-flex h-8.5 items-center gap-2 rounded-full border border-line px-3 text-[12px] text-ink-2 transition-colors hover:border-line-strong"
+              <>
+                <Button
+                  asChild
+                  size="sm"
+                  variant="ghost"
+                  className="hidden lg:inline-flex"
+                  title="Finish setting up your profile"
                 >
-                  <LogOut className="size-3.5 text-ink-faint" />
-                  <span className="max-w-24 truncate">
-                    {user.displayName ?? user.email ?? "Account"}
-                  </span>
-                </button>
-              </form>
+                  <Link href="/onboarding">Set up profile</Link>
+                </Button>
+                <form action="/auth/signout" method="post" className="hidden sm:block">
+                  <button
+                    type="submit"
+                    title={user.email ?? undefined}
+                    className="inline-flex h-8.5 items-center gap-2 rounded-full border border-line px-3 text-[12px] text-ink-2 transition-colors hover:border-line-strong"
+                  >
+                    <LogOut className="size-3.5 text-ink-faint" />
+                    <span className="max-w-24 truncate">
+                      {user.displayName ?? user.email ?? "Account"}
+                    </span>
+                  </button>
+                </form>
+              </>
             ) : (
               <Button asChild size="sm" variant="outline" className="hidden sm:inline-flex">
                 <Link href="/auth/signin">

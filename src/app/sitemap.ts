@@ -14,7 +14,18 @@ export const revalidate = 3600;
 const BASE = process.env.NEXT_PUBLIC_APP_URL || "http://localhost:3000";
 
 export default async function sitemap(): Promise<MetadataRoute.Sitemap> {
-  const staticRoutes = ["", "/discover", "/briefs", "/briefs/new", "/engagements", "/trust", "/model", "/deck", "/onboarding/identity"];
+  const staticRoutes = [
+    "",
+    "/discover",
+    "/briefs",
+    "/briefs/new",
+    "/engagements",
+    "/trust",
+    "/model",
+    "/deck",
+    "/onboarding",
+    "/onboarding/identity",
+  ];
 
   const creators = await getCreators();
 
