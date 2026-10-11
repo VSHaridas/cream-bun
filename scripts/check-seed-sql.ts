@@ -39,6 +39,24 @@ if (failed) {
 const seed = readFileSync(SEED, "utf8");
 const unseed = readFileSync(UNSEED, "utf8");
 
+/**
+ * Shared vocabulary, excluded from unseed on purpose.
+ *
+ * A real creator's portfolio references `tools`, `models` and the rest by id.
+ * Deleting them to "clean up" would break rows belonging to real users.
+ */
+const TAXONOMY = new Set([
+  "tools",
+  "models",
+  "skills",
+  "content_types",
+  "aspect_ratios",
+  "specializations",
+  "industries",
+  "channels",
+  "regions",
+]);
+
 /* ── transaction wrapper ─────────────────────────────────────────────────── */
 
 const begins = (seed.match(/^begin;$/gm) ?? []).length;
@@ -121,13 +139,59 @@ else fail("no scoped deletes — child tables without keys would duplicate on re
 // Each scoped delete immediately precedes the insert it clears rows for, so
 // the unseed only needs one statement per table — not one per seed statement.
 const unseedDeletes = splitStatements(unseed).filter((s) => /^\s*delete from/i.test(s));
-const seededTables = new Set(inserts.map((s) => s.match(/insert into\s+public\.(\w+)/i)?.[1]));
+const seededTables = new Set(
+  inserts
+    .map((s) => s.match(/insert into\s+public\.(\w+)/i)?.[1])
+    .filter((t): t is string => Boolean(t) && !TAXONOMY.has(t!)),
+);
 const unseedTables = new Set(
   unseedDeletes.map((s) => s.match(/delete from\s+public\.(\w+)/i)?.[1]),
 );
 const notReversed = [...seededTables].filter((t) => !unseedTables.has(t));
-if (notReversed.length === 0) pass(`unseed reverses all ${seededTables.size} seeded tables`);
-else fail(`unseed is missing: ${notReversed.join(", ")}`);
+if (notReversed.length === 0) {
+  pass(`unseed reverses all ${seededTables.size} seeded non-taxonomy tables`);
+} else {
+  fail(`unseed is missing: ${notReversed.join(", ")}`);
+}
+
+/* ── unseed must be scoped, not destructive ──────────────────────────────── */
+
+// Every delete names specific identifiers. A bare `delete from public.x cascade`
+// would wipe real accounts along with the demo data.
+const bareDeletes = unseedDeletes.filter((s) => !/where/i.test(s));
+if (bareDeletes.length === 0) {
+  pass("every unseed delete is scoped by identifier");
+} else {
+  fail(
+    `${bareDeletes.length} unseed delete(s) have no WHERE clause — these would remove real rows: ` +
+      bareDeletes
+        .map((s) => s.match(/delete from\s+public\.(\w+)/i)?.[1])
+        .filter(Boolean)
+        .join(", "),
+  );
+}
+
+// The discriminator: `handle_new_user()` appends six hex characters of the
+// user's uuid to their handle. No identifier in a delete may end that way, or
+// it could match a real account.
+const realLooking = unseedDeletes.filter((s) => /'-[0-9a-f]{6}'/.test(s));
+if (realLooking.length === 0) {
+  pass("no delete targets an identifier shaped like a real account handle");
+} else {
+  fail(
+    `${realLooking.length} delete(s) reference an identifier with a uuid suffix — that is the real-account shape`,
+  );
+}
+
+// Taxonomy is shared with real users. Deleting it breaks real portfolios.
+const deletedTaxonomy = unseedDeletes.filter((s) =>
+  [...TAXONOMY].some((t) => new RegExp(`delete from\\s+public\\.${t}\\b`, "i").test(s)),
+);
+if (deletedTaxonomy.length === 0) {
+  pass("taxonomy tables are preserved — real portfolios reference them by id");
+} else {
+  fail("unseed deletes shared taxonomy, which real rows reference by id");
+}
 
 /* ── the hazards this generator exists to avoid ─────────────────────────── */
 

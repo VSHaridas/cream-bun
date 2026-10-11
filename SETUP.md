@@ -88,11 +88,17 @@ Paste `seed.sql` into the SQL editor and run. It is one transaction, so a
 failure writes nothing rather than leaving a half-populated graph. Re-running is
 safe: every statement is an upsert, or a scoped delete followed by an insert.
 
-To go back to an empty state, paste `unseed.sql`. **It deletes every row in
-those tables, including anything created through the UI** — the schema has no
-dataset discriminator yet, so seed rows and real rows cannot be told apart. On a
-demo project that is what you want; on a project holding real work, do not run
-it. (Tracked as P1-2 in `reference/floating-tasks.md`.)
+To go back to an empty state, paste `unseed.sql`.
+
+**It is scoped, not destructive.** Every delete names the specific rows the seed
+wrote, so briefs, offers and accounts you create through the UI survive it. The
+discriminator is already in the schema: `handle_new_user()` appends six hex
+characters of the user's own uuid to their handle (`cr-tihens7-a3f9c1`), where
+seed slugs are clean (`cr-aarav`).
+
+Taxonomy tables — `tools`, `models`, `skills`, `aspect_ratios` and the rest —
+are **not** removed. They are shared vocabulary, and a real creator's portfolio
+references them by id.
 
 Both files are generated, not hand-written:
 

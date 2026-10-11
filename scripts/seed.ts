@@ -1148,42 +1148,203 @@ function renderSqlFile(tables: SeedTable[]): string {
 }
 
 /**
- * The inverse: remove everything seed.sql writes.
+ * The inverse: remove everything seed.sql writes, and nothing else.
  *
- * Deletes in reverse dependency order so a parent is never removed while a
- * child still references it, and uses `cascade` as a backstop rather than the
- * mechanism — being explicit means the order is correct on its own terms.
+ * Scoped by row, not by table. `delete from public.creators cascade` would take
+ * out a real account too, which is the whole reason this file cannot just
+ * truncate. Instead each delete names the exact identifiers it wrote, and
+ * `cascade` handles only the children of *those* rows.
  *
- * This deletes the seed rows *and* any row created through the UI in the same
- * tables. There is no dataset discriminator in the schema yet, so the two cannot
- * be told apart; scoping would need a `dataset` column, which is tracked as
- * P1-2 in reference/floating-tasks.md. Treat this as a demo-project operation.
+ * The seed identifiers are recognisable because the schema gives real accounts
+ * a different shape: `handle_new_user()` appends six characters of the user's
+ * own uuid to the handle (`cr-tihens7-a3f9c1`), while the seed slugs are clean
+ * (`cr-aarav`). Every non-taxonomy seed id is short and has no hex suffix, so
+ * `not like '%-[0-9a-f]{6}$'` cannot match a real account.
+ *
+ * Taxonomy rows — tools, models, skills, aspect ratios and the rest — are shared
+ * reference data, not seed identities. A real creator's portfolio references
+ * them by id, so deleting them would break real rows. They are left in place.
  */
 function renderUnseedFile(tables: SeedTable[]): string {
-  const order = [...tables].reverse();
+  // Tables that hold only vocabulary shared with real users. Left alone.
+  const TAXONOMY = new Set([
+    "tools",
+    "models",
+    "skills",
+    "content_types",
+    "aspect_ratios",
+    "specializations",
+    "industries",
+    "channels",
+    "regions",
+  ]);
+
+  const targets = tables.filter((t) => !TAXONOMY.has(t.table));
+  const order = [...targets].reverse();
+
+  const deletes = order.map((t) => {
+    const { ids, column, via } = identifySeedRows(t, tables);
+    if (!ids.length) {
+      return `-- ${t.table}: nothing to identify, left alone`;
+    }
+
+    if (via) {
+      // The child hangs off a parent whose id is a uuid column that the domain
+      // addresses by slug. Select through the parent rather than trying to
+      // reconstruct a uuid we do not have.
+      return [
+        `delete from public.${t.table} where ${column} in (`,
+        `  select p.id from public.${via.table} p where p.${via.column} in (${via.ids.map((v) => literal(v)).join(", ")})`,
+        `) cascade;`,
+      ].join("\n");
+    }
+
+    return `delete from public.${t.table} where ${column} in (${ids.map((v) => literal(v)).join(", ")}) cascade;`;
+  });
+
+  const tableCount = targets.filter(
+    (t) => identifySeedRows(t, tables).ids.length > 0,
+  ).length;
 
   return [
     `-- CREAM — remove the demo dataset`,
     `--`,
-    `-- Generated alongside supabase/seed.sql. Reverses it exactly: the same tables,`,
-    `-- deleted in reverse dependency order.`,
+    `-- Generated alongside supabase/seed.sql. Reverses it exactly, by row.`,
     `--`,
-    `--   ${order.length} tables. ${new Date().toISOString()}`,
+    `--   ${tableCount} tables. ${new Date().toISOString()}`,
     `--`,
-    `-- WARNING — this removes every row in these tables, including briefs and`,
-    `-- accounts created through the UI while the demo data was loaded. The schema`,
-    `-- has no dataset discriminator, so seed rows and real rows are not yet`,
-    `-- distinguishable. See P1-2 in reference/floating-tasks.md.`,
+    `-- SCOPED. Every delete names the specific seed rows, so accounts, briefs and`,
+    `-- offers created through the UI are left untouched. Only rows whose identifier`,
+    `-- was written by seed.sql are removed, plus whatever cascades from them.`,
     `--`,
-    `-- On a demo project this is the expected way to switch the site back to an`,
-    `-- empty state. On a project holding real work, do not run it.`,
-    "",
-    "begin;",
-    "",
-    ...order.map((t) => `delete from public.${t.table} cascade;`),
-    "commit;",
-    "",
+    `-- Identifiers are recognisable because handle_new_user() appends six hex`,
+    `-- characters of the user's own uuid to their handle (cr-tihens7-a3f9c1),`,
+    `-- where every seed slug is clean (cr-aarav).`,
+    `--`,
+    `-- Taxonomy tables (tools, models, skills, aspect ratios, and so on) are NOT`,
+    `-- removed. They are shared vocabulary: a real creator's portfolio references`,
+    `-- them by id, so deleting them would break real rows. They are left in place`,
+    `-- and the application never renders them directly.`,
+    `--`,
+    `begin;`,
+    ``,
+    ...deletes.flatMap((d) => [d, ``]),
+    `commit;`,
+    ``,
   ].join("\n");
+}
+
+/** How to name a set of rows in a DELETE. */
+interface SeedIds {
+  ids: string[];
+  /** The column to match on. */
+  column: string;
+  /** Set when the rows are addressed through a parent's slug rather than their own. */
+  via?: { table: string; column: string; ids: string[] };
+}
+
+/**
+ * Works out how to name this table's rows.
+ *
+ * Three cases, in order of preference:
+ *
+ *  1. A `slug` or `id` column holding text. Directly nameable.
+ *  2. A uuid foreign key whose parent is itself named in this file — resolve the
+ *     child through `select … where parent.slug in (…)`, because the child's own
+ *     id is a uuid we never had in the first place.
+ *  3. Nothing identifiable, in which case the table is left alone rather than
+ *     guessed at.
+ */
+function identifySeedRows(
+  { table, rows }: SeedTable,
+  all: SeedTable[],
+): SeedIds {
+  const keys = rows.length ? Object.keys(rows[0]) : [];
+
+  // Case 1: the rows carry a stable text identifier.
+  for (const column of ["slug", "id"]) {
+    if (!keys.includes(column)) continue;
+    const values = [
+      ...new Set(rows.map((r) => r[column]).filter((v) => typeof v === "string")),
+    ];
+    if (values.length && values.every((v) => isSeedIdentifier(String(v)))) {
+      // `id` is only safe when it is text. Several uuid-keyed tables have a
+      // column called id that is not.
+      return { ids: values as string[], column };
+    }
+  }
+
+  // Case 2: reach through a parent.
+  const parents = PARENTS_OF[table];
+  if (parents) {
+    const parent = all.find((t) => t.table === parents.table);
+    if (parent) {
+      const parentIds = identifySeedRows(parent, all);
+      if (parentIds.ids.length) {
+        return {
+          ids: parentIds.ids,
+          column: parents.column,
+          via: {
+            table: parents.table,
+            column: parentIds.column,
+            ids: parentIds.ids,
+          },
+        };
+      }
+    }
+  }
+
+  return { ids: [], column: "id" };
+}
+
+/** Child table -> the parent it hangs off, where the child has no key of its own. */
+const PARENTS_OF: Record<string, { table: string; column: string }> = {
+  brief_sessions: { table: "brands", column: "brand_id" },
+  conversation_turns: { table: "brief_sessions", column: "session_id" },
+  brief_deliverables: { table: "briefs", column: "brief_id" },
+  commercial_use: { table: "briefs", column: "brief_id" },
+  creator_stats: { table: "creators", column: "creator_id" },
+  creator_languages: { table: "creators", column: "creator_id" },
+  creator_specializations: { table: "creators", column: "creator_id" },
+  creator_content_types: { table: "creators", column: "creator_id" },
+  creator_aspect_ratios: { table: "creators", column: "creator_id" },
+  creator_tools: { table: "creators", column: "creator_id" },
+  creator_skills: { table: "creators", column: "creator_id" },
+  creator_models: { table: "creators", column: "creator_id" },
+  creator_workflows: { table: "creators", column: "creator_id" },
+  creator_regions: { table: "creators", column: "creator_id" },
+  portfolio_pieces: { table: "creators", column: "creator_id" },
+  portfolio_piece_tools: { table: "portfolio_pieces", column: "portfolio_piece_id" },
+  portfolio_piece_models: { table: "portfolio_pieces", column: "portfolio_piece_id" },
+  portfolio_piece_skills: { table: "portfolio_pieces", column: "portfolio_piece_id" },
+  brand_preferred_formats: { table: "brands", column: "brand_id" },
+  offers: { table: "briefs", column: "brief_id" },
+  offer_milestones: { table: "offers", column: "offer_id" },
+  contracts: { table: "offers", column: "offer_id" },
+  engagements: { table: "briefs", column: "brief_id" },
+  generation_rounds: { table: "engagements", column: "engagement_id" },
+  generation_samples: { table: "generation_rounds", column: "round_id" },
+  escrows: { table: "engagements", column: "engagement_id" },
+  contract_clauses: { table: "contracts", column: "contract_id" },
+  contract_signatures: { table: "contracts", column: "contract_id" },
+  identity_verifications: { table: "creators", column: "creator_id" },
+  // Shortlists reference a brand rather than a parent that owns them, so they
+  // are keyed off the brand. Both columns are text, so either would do; brand
+  // is the one that scopes to a seed row.
+  shortlists: { table: "brands", column: "brand_id" },
+};
+
+/**
+ * True when an identifier could only have come from the seed.
+ *
+ * Seed ids are short slugs: `cr-aarav`, `br-monsoon`, `of-aarav-monsoon`.
+ * Real accounts carry six hex characters of their own uuid, because
+ * `handle_new_user()` appends them to guarantee handle uniqueness. Requiring
+ * that suffix to be absent is what makes the delete safe — it cannot match a
+ * real account even if a person chose the handle `aarav`.
+ */
+function isSeedIdentifier(value: string) {
+  return !/-[0-9a-f]{6}$/.test(value);
 }
 
 main()
