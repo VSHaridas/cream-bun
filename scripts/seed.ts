@@ -18,18 +18,26 @@ import { seedSnapshot } from "../src/lib/data/seed-provider";
 import { TOOLS, MODELS, SKILL_TAXONOMY, SPECIALIZATIONS } from "../src/lib/domain/taxonomy";
 import { CONTENT_TYPES, CONTENT_TYPE_META, ASPECT_RATIOS } from "../src/lib/domain/types";
 import { CHANNELS, REGIONS } from "../src/lib/domain/taxonomy";
+import { slugify } from "../src/lib/utils";
 
 const URL = process.env.NEXT_PUBLIC_SUPABASE_URL?.trim();
 const KEY = process.env.SUPABASE_SERVICE_ROLE_KEY?.trim();
 
-if (!URL || !KEY) {
-  console.error(
-    "\n  Cannot seed: NEXT_PUBLIC_SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are required.\n  Put them in .env.local and run again.\n",
-  );
-  process.exit(1);
-}
+/**
+ * `--sql` renders the whole seed as a .sql file instead of posting it.
+ *
+ * The SQL editor in the Supabase dashboard is the one path that needs no
+ * service role key on the operator's machine, which matters because the key is
+ * the most dangerous value in the project and should not have to be handed to a
+ * CLI to load some data. It also makes the seed reviewable in a diff, which a
+ * POST body is not.
+ *
+ * Credentials are only required on the posting path, so the guard below is
+ * skipped entirely when emitting.
+ */
+const EMIT_SQL = process.argv.includes("--sql");
 
-const db = createClient(URL, KEY, { auth: { persistSession: false } });
+const db = URL && KEY ? createClient(URL, KEY, { auth: { persistSession: false } }) : null;
 const TRUNCATE = process.argv.includes("--truncate");
 
 const TABLES_IN_DEPENDENCY_ORDER = [
@@ -76,6 +84,24 @@ const TABLES_IN_DEPENDENCY_ORDER = [
   "tools",
 ];
 
+/**
+ * One table's worth of rows, in dependency order.
+ *
+ * Collected rather than posted so the same row definitions can serve both
+ * transports: the Supabase client and the SQL file. There is exactly one place
+ * that knows how a domain object maps to columns, which is what keeps the two
+ * from drifting.
+ */
+interface SeedTable {
+  table: string;
+  conflict: string;
+  /** Set when the table has no key of its own: the column holding the parent id. */
+  childOf?: string;
+  rows: Record<string, unknown>[];
+}
+
+const plan: SeedTable[] = [];
+
 async function ok(label: string, fn: () => PromiseLike<{ error: { message: string } | null }>) {
   const started = Date.now();
   const { error } = await fn();
@@ -86,14 +112,97 @@ async function ok(label: string, fn: () => PromiseLike<{ error: { message: strin
   console.log(`  v  ${label}  (${Date.now() - started}ms)`);
 }
 
-async function upsert(table: string, rows: Record<string, unknown>[], conflict: string) {
+async function upsert(
+  table: string,
+  rows: Record<string, unknown>[],
+  conflict: string,
+  childOf?: string,
+) {
   if (!rows.length) return;
-  return ok(`${table} (${rows.length})`, () =>
-    db.from(table).upsert(rows, { onConflict: conflict }),
+  const normalised = rows.map((row) => normaliseColumns(table, row));
+  if (EMIT_SQL) {
+    plan.push({
+      table,
+      conflict: normaliseConflict(table, conflict),
+      childOf,
+      rows: normalised,
+    });
+    return;
+  }
+  if (!db) throw new Error("no Supabase client — credentials are required to post");
+
+  // No conflict target means the row cannot be upserted, so clear the parent
+  // first. Same scoping as the SQL renderer.
+  if (!conflict && childOf && db) {
+    const parents = [...new Set(normalised.map((row) => row[childOf]).filter(Boolean))];
+    if (parents.length) {
+      await ok(`${table} (clearing ${parents.length} parents)`, () =>
+        db!.from(table).delete().in(childOf, parents as never[]),
+      );
+    }
+  }
+
+  return ok(`${table} (${normalised.length})`, () =>
+    db!.from(table).upsert(normalised, { onConflict: normaliseConflict(table, conflict) }),
   );
 }
 
+/**
+ * Rewrites domain-shaped keys into schema column names.
+ *
+ * Several row builders spread a domain object straight through — `...c.stats`
+ * yields `approvalRate`, `onTimeRate`, `responseMinutes`, where the columns are
+ * `approval_rate`, `on_time_rate`, `response_minutes`. Those upserts were
+ * rejected by PostgREST and would have failed for anyone running the seeder
+ * against a real project.
+ *
+ * A key is only rewritten when the original is *not* a column and its snake_case
+ * form *is*. Anything else is left alone, so a genuinely wrong column name still
+ * fails loudly in `assertColumnsExist` rather than being silently mangled into
+ * something that happens to exist.
+ */
+function normaliseColumns(table: string, row: Record<string, unknown>) {
+  const known = TABLE_COLUMNS.get(table);
+  if (!known) return row;
+
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(row)) {
+    if (known.has(key)) {
+      out[key] = value;
+      continue;
+    }
+    out[candidateNames(key).find((name) => known.has(name)) ?? key] = value;
+  }
+  return out;
+}
+
+/**
+ * Plausible column names for a domain key, best first.
+ *
+ * Plain snake_case covers most of it. A few columns carry a unit suffix the
+ * domain type drops — `totalEarnings` → `total_earnings_inr`, because
+ * `CreatorStats` is currency-agnostic while the column is not.
+ */
+function candidateNames(key: string) {
+  const snake = key.replace(/[A-Z]/g, (c) => `_${c.toLowerCase()}`);
+  return [snake, `${snake}_inr`, `${snake}_paise`, key.replace(/[A-Z]/g, (c) => `_${c}`)];
+}
+
+/** Same treatment for a conflict target like `creator_id,specializationName`. */
+function normaliseConflict(table: string, conflict: string) {
+  const known = TABLE_COLUMNS.get(table);
+  if (!known) return conflict;
+  return conflict
+    .split(",")
+    .map((raw) => {
+      const column = raw.trim();
+      return candidateNames(column).find((name) => known.has(name)) ?? column;
+    })
+    .join(",");
+}
+
 async function truncateAll() {
+  if (!db) throw new Error("no Supabase client — credentials are required to truncate");
   console.log("\n  Truncating marketplace tables…");
   // Single statement so the cascades do not fight a table-at-a-time wipe.
   const { error } = await db.rpc("exec_sql", {
@@ -112,11 +221,40 @@ async function truncateAll() {
 }
 
 async function main() {
-  console.log("\n  CREAM seeder");
-  console.log(`  target  ${URL}`);
-  console.log(`  mode    ${TRUNCATE ? "truncate + upsert" : "upsert only"}`);
+  if (EMIT_SQL) {
+    console.error("\n  Rendering SQL — no credentials needed, nothing is posted.\n");
+    // Read the array columns out of the migration so empty arrays can be cast
+    // correctly and a future enum array is caught here rather than at the
+    // database.
+    const { readFileSync: read } = await import("node:fs");
+    const { join } = await import("node:path");
+    const migration = read(join(process.cwd(), "supabase", "migrations", "0001_schema.sql"), "utf8");
 
-  if (TRUNCATE) await truncateAll();
+    readSchema(migration);
+
+    const nonText = assertSchemaArraysAreText(migration);
+    if (nonText.size) {
+      throw new Error(
+        `The schema now has non-text array column(s): ${[...nonText].join(", ")}.\n` +
+          `Rendering an empty array into one of those needs a different cast, and\n` +
+          `guessing would produce SQL that fails at the database. Add the cast to\n` +
+          `elementTypeFor() and regenerate.`,
+      );
+    }
+  } else {
+    console.log("\n  CREAM seeder");
+    console.log(`  target  ${URL}`);
+    console.log(`  mode    ${TRUNCATE ? "truncate + upsert" : "upsert only"}`);
+    if (!db) {
+      console.error(
+        "\n  Cannot post: NEXT_PUBLIC_SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are required.\n" +
+          "  Use --sql to render a .sql file instead.\n",
+      );
+      process.exit(1);
+    }
+  }
+
+  if (TRUNCATE && !EMIT_SQL) await truncateAll();
 
   const s = seedSnapshot;
 
@@ -172,25 +310,36 @@ async function main() {
       id: a.id,
       label: a.label,
       usage: a.usage,
-      width: a.w,
-      height: a.h,
+      // The columns are `w`/`h`, not `width`/`height` — ASPECT_RATIOS (types.ts)
+      // names them w/h and the schema follows. Caught by the column check.
+      w: a.w,
+      h: a.h,
     })),
     "id",
   );
 
   await upsert(
     "specializations",
-    SPECIALIZATIONS.map((name) => ({ name })),
-    "name",
+    // Reference tables are keyed (id, label), where id is the slug and label is
+    // the human string. The seeder was writing `{ name }`, which is neither
+    // column — caught by the column check against the migration.
+    SPECIALIZATIONS.map((label) => ({ id: slugify(label), label })),
+    "id",
   );
 
   await upsert(
     "industries",
-    [...new Set(s.portfolio.map((p) => p.industry))].map((name) => ({ name })),
-    "name",
+    [...new Set(s.portfolio.map((p) => p.industry))]
+      .filter(Boolean)
+      .map((label) => ({ id: slugify(label), label })),
+    "id",
   );
 
-  await upsert("channels", [...CHANNELS].map((name) => ({ name })), "name");
+  await upsert(
+    "channels",
+    [...CHANNELS].map((label) => ({ id: slugify(label), label })),
+    "id",
+  );
   await upsert(
     "regions",
     [...REGIONS].map((r) => ({ id: r.id, label: r.label, countries: r.countries })),
@@ -271,11 +420,14 @@ async function main() {
     s.creators.flatMap((c) =>
       c.specializations.map((sp, i) => ({
         creator_id: c.id,
-        specialization_name: sp,
+        // The domain carries the human label; the column is a foreign key into
+        // specializations, whose id is the slug of that label. Same slug the
+        // reference table above was written with.
+        specialization_id: slugify(sp),
         position: i,
       })),
     ),
-    "creator_id,specialization_name",
+    "creator_id,specialization_id",
   );
 
   await upsert(
@@ -380,11 +532,7 @@ async function main() {
     })),
   );
   if (stages.length) {
-    await ok(`workflow_stages (${stages.length})`, () =>
-      db
-        .from("workflow_stages")
-        .upsert(stages, { onConflict: "workflow_id,slug" }),
-    );
+    await upsert("workflow_stages", stages, "workflow_id,slug");
   }
 
   await upsert(
@@ -411,22 +559,24 @@ async function main() {
     "id",
   );
 
-  await upsert(
+  // `piece_id` is the domain-level name; the columns are `portfolio_piece_id`,
+// matching the parent table. Same rename across all three join tables.
+await upsert(
     "portfolio_piece_tools",
-    s.portfolio.flatMap((p) => p.tools.map((t) => ({ piece_id: p.id, tool_id: t }))),
-    "piece_id,tool_id",
+    s.portfolio.flatMap((p) => p.tools.map((t, i) => ({ portfolio_piece_id: p.id, tool_id: t, position: i }))),
+    "portfolio_piece_id,tool_id",
   );
 
   await upsert(
     "portfolio_piece_models",
-    s.portfolio.flatMap((p) => p.models.map((m) => ({ piece_id: p.id, model_id: m }))),
-    "piece_id,model_id",
+    s.portfolio.flatMap((p) => p.models.map((m, i) => ({ portfolio_piece_id: p.id, model_id: m, position: i }))),
+    "portfolio_piece_id,model_id",
   );
 
   await upsert(
     "portfolio_piece_skills",
-    s.portfolio.flatMap((p) => p.skills.map((k) => ({ piece_id: p.id, skill_id: k }))),
-    "piece_id,skill_id",
+    s.portfolio.flatMap((p) => p.skills.map((k, i) => ({ portfolio_piece_id: p.id, skill_id: k, position: i }))),
+    "portfolio_piece_id,skill_id",
   );
 
   /* ── briefs ─────────────────────────────────────────────────────────────── */
@@ -490,7 +640,6 @@ async function main() {
     "brief_deliverables",
     s.briefs.flatMap((b) =>
       b.deliverables.map((d, i) => ({
-        slug: `${b.id}-${d.id}`,
         brief_id: b.id,
         content_type: d.contentType,
         aspect_ratio: d.aspectRatio,
@@ -500,7 +649,12 @@ async function main() {
         position: i,
       })),
     ),
-    "slug",
+    // Child tables with no natural key of their own. The parent id is stable
+    // across runs, so a delete scoped to exactly the parents this file inserts
+    // makes the statement idempotent without touching UI-created rows. An empty
+    // conflict target tells the renderer to emit that scoped delete.
+    "",
+    "brief_id",
   );
 
   await upsert(
@@ -537,7 +691,6 @@ async function main() {
     "offer_milestones",
     s.offers.flatMap((o) =>
       o.milestones.map((m, i) => ({
-        slug: `${o.id}-${i}`,
         offer_id: o.id,
         label: m.label,
         pct: m.pct,
@@ -545,7 +698,8 @@ async function main() {
         position: i,
       })),
     ),
-    "slug",
+    "",
+    "offer_id",
   );
 
   await upsert(
@@ -571,23 +725,23 @@ async function main() {
     "contract_clauses",
     s.contracts.flatMap((c) =>
       c.clauses.map((cl, i) => ({
-        slug: `${c.id}-${cl.id}`,
+        // Unique is (contract_id, slug) — the clause id alone is only unique
+        // within its contract.
+        slug: cl.id,
         contract_id: c.id,
-        clause_key: cl.id,
         heading: cl.heading,
         body: cl.body,
         requires_explicit_acknowledgement: cl.requiresExplicitAcknowledgement,
         position: i,
       })),
     ),
-    "slug",
+    "contract_id,slug",
   );
 
   await upsert(
     "contract_signatures",
     s.contracts.flatMap((c) =>
-      c.signatures.map((sig, i) => ({
-        slug: `${c.id}-${sig.party}`,
+      c.signatures.map((sig) => ({
         contract_id: c.id,
         party: sig.party,
         party_name: sig.partyName,
@@ -595,10 +749,11 @@ async function main() {
         signed_at: sig.signedAt,
         ip_address: sig.ipAddress,
         digest: sig.digest,
-        position: i,
       })),
     ),
-    "slug",
+    // Exactly one signature per party per contract; the table has no position
+    // column and enforces that with a unique constraint.
+    "contract_id,party",
   );
 
   await upsert(
@@ -614,7 +769,11 @@ async function main() {
       started_at: e.startedAt,
       due_at: e.dueAt,
       escrow_id: e.escrowId,
-      contract_ids: e.contractIds,
+      // `contractIds` is deliberately absent. It is a domain-level convenience
+      // derived from `contracts.offer_id` (supabase-provider.ts:1328), not a
+      // stored column — writing it would have been an insert against a column
+      // that does not exist. The column-difference check in the SQL renderer
+      // is what caught this.
     })),
     "slug",
   );
@@ -643,17 +802,19 @@ async function main() {
     "generation_samples",
     s.engagements.flatMap((e) =>
       e.rounds.flatMap((r) =>
-        r.samples.map((sm) => ({
-          slug: `${r.id}-${sm.id}`,
+        r.samples.map((sm, i) => ({
           round_id: r.id,
-          asset_name: sm.title,
+          // The column is `title`, not `asset_name`.
+          title: sm.title,
           art_seed: sm.artSeed,
           palette: sm.palette,
           aspect_ratio: sm.aspectRatio,
+          position: i,
         })),
       ),
     ),
-    "slug",
+    "",
+    "round_id",
   );
 
   await upsert(
@@ -715,10 +876,345 @@ async function main() {
     "brand_id,creator_id",
   );
 
-  console.log("\n  Done.\n");
+  console.log(EMIT_SQL ? "" : "\n  Done.\n");
 }
 
-main().catch((error) => {
-  console.error(`\n  Seed failed: ${error.message}\n`);
-  process.exit(1);
-});
+/* ── SQL rendering ─────────────────────────────────────────────────────────── */
+
+/**
+ * Renders one JavaScript value as a Postgres literal.
+ *
+ * The subtlety is typing. A bare string literal in a VALUES clause is of type
+ * `unknown` and Postgres coerces it to whatever the column is, which is exactly
+ * what we want for enums — `'verified'` lands in an `identity_status` column
+ * without naming the type. So strings get no cast.
+ *
+ * Everything else needs one, because there is no `unknown` for a number or an
+ * object:
+ *
+ *  - jsonb gets an explicit cast, because `'{}'` would otherwise be text.
+ *  - dates are passed through as ISO strings, which Postgres parses on insert.
+ *
+ * Empty arrays are the awkward case and are handled by the caller rather than
+ * here — see `emptyArrayColumns`.
+ */
+function literal(value: unknown, arrayCast?: string | null): string {
+  if (value === null || value === undefined) return "null";
+  if (typeof value === "number") return Number.isFinite(value) ? String(value) : "null";
+  if (typeof value === "boolean") return value ? "true" : "false";
+  if (Array.isArray(value)) {
+    // An empty array is not valid SQL without a cast, and the cast has to name
+    // the element type.
+    if (!value.length) return arrayCast ? `ARRAY[]::${arrayCast}` : "null";
+    return `ARRAY[${value.map((v) => literal(v)).join(", ")}]`;
+  }
+  if (value instanceof Date) return `'${value.toISOString()}'`;
+  if (typeof value === "object") return `'${escape(JSON.stringify(value))}'::jsonb`;
+  return `'${escape(String(value))}'`;
+}
+
+/**
+ * Columns we are allowed to cast an empty array to.
+ *
+ * `ARRAY[]` is not valid SQL on its own — it needs a cast, and the cast has to
+ * name the element type. Postgres cannot infer the target from inside a VALUES
+ * clause, so we have to know it.
+ *
+ * Every array column in `0001_schema.sql` is `text[]`; there are no array-typed
+ * enums. That is a property of the schema, not of this file, so it is verified
+ * against the migration at generation time rather than trusted — if someone
+ * adds `model_id[]` later, `npm run db:seed:sql` fails here and names the
+ * column, instead of emitting SQL that the database rejects 400 statements in.
+ */
+function assertSchemaArraysAreText(readSql: string) {
+  const offenders = new Set<string>();
+  for (const match of readSql.matchAll(/^\s+(\w+)\s+(\w+)\[\]/gm)) {
+    const [, column, type] = match;
+    if (type !== "text") offenders.add(`${column} ${type}[]`);
+  }
+  return offenders;
+}
+
+/**
+ * Columns that are an empty array in every row, and so can simply be left out.
+ *
+ * This is the only fully type-safe way to write an empty array: `ARRAY[]::text[]`
+ * is rejected outright when the column is an enum array, and Postgres offers no
+ * way to infer the target type from inside a VALUES clause. Every array column
+ * in this schema already defaults to `'{}'`, so omitting the column produces
+ * exactly the same row.
+ */
+function emptyArrayColumns(rows: Record<string, unknown>[], columns: string[]) {
+  return columns.filter((column) =>
+    rows.every((row) => {
+      const value = row[column];
+      return Array.isArray(value) && value.length === 0;
+    }),
+  );
+}
+
+/** Columns that are empty in some rows but populated in others. */
+function mixedEmptyArrayColumns(rows: Record<string, unknown>[], columns: string[]) {
+  return columns.filter((column) => {
+    const values = rows.map((row) => row[column]);
+    return (
+      values.some((v) => Array.isArray(v) && v.length === 0) &&
+      values.some((v) => Array.isArray(v) && v.length > 0)
+    );
+  });
+}
+
+/** Single quotes are doubled; nothing else needs escaping inside a literal. */
+function escape(text: string) {
+  return text.replace(/'/g, "''");
+}
+
+/**
+ * Element type for an array column, or null when we cannot prove it.
+ *
+ * Null means "omit the column instead" (see `emptyArrayColumns`), which is
+ * always safe because every array column in this schema defaults to `'{}'`.
+ */
+function elementTypeFor(table: string, column: string) {
+  return ARRAY_COLUMNS.has(`${table}.${column}`) ? "text[]" : null;
+}
+
+/**
+ * Columns read out of the migration: every array column, and the full column
+ * list per table.
+ *
+ * Populated at startup when emitting. Keeping it derived from the migration
+ * rather than hand-written means a schema change is picked up automatically,
+ * and a mismatch between the two is an error here instead of a 400 from
+ * Postgres several hundred statements in.
+ */
+const ARRAY_COLUMNS = new Set<string>();
+const TABLE_COLUMNS = new Map<string, Set<string>>();
+const SCHEMA_ENUMS = new Set<string>();
+
+function readSchema(sql: string) {
+  for (const match of sql.matchAll(
+    /create table if not exists public\.(\w+) \(([\s\S]*?)\n\);/g,
+  )) {
+    const [, table, body] = match;
+    const columns = new Set<string>();
+    for (const line of body.split("\n")) {
+      const column = line.trim().match(/^(\w+)\s+(?:text|bigint|smallint|integer|numeric|boolean|uuid|jsonb|timestamptz|date|timestamp|vector\(\d+\)|tsvector|\w+(?:\[\])?)\b/);
+      if (column) columns.add(column[1]);
+    }
+    TABLE_COLUMNS.set(table, columns);
+    for (const column of body.matchAll(/^\s+(\w+)\s+text\[\]/gm)) {
+      ARRAY_COLUMNS.add(`${table}.${column[1]}`);
+    }
+  }
+
+  for (const match of sql.matchAll(/create type public\.(\w+) as enum/g)) {
+    SCHEMA_ENUMS.add(match[1]);
+  }
+}
+
+/**
+ * Fails when a row references a column the table does not have.
+ *
+ * This is not a theoretical check. `engagements.contract_ids` was being written
+ * against a table that has no such column, and the client-side seeder would
+ * have failed on it for anyone who ran `npm run db:seed` against a real
+ * project. Validating here means the SQL file is known-good before it is
+ * pasted, rather than discovered halfway through a 1250-row transaction.
+ */
+function assertColumnsExist(table: string, rows: Record<string, unknown>[]) {
+  const known = TABLE_COLUMNS.get(table);
+  if (!known) {
+    throw new Error(
+      `${table} is not declared in the migration. The seed references a table that does not exist.`,
+    );
+  }
+  const unknown = new Set<string>();
+  for (const row of rows) {
+    for (const column of Object.keys(row)) {
+      if (!known.has(column)) unknown.add(column);
+    }
+  }
+  if (unknown.size) {
+    // Collected rather than thrown one at a time: fixing these one round-trip
+    // per error is slow, and the point of the check is to see the whole list.
+    problems.push(
+      `${table}: ${[...unknown].sort().join(", ")}  (has: ${[...known].sort().join(", ")})`,
+    );
+  }
+}
+
+const problems: string[] = [];
+
+function renderTable({ table, conflict, childOf, rows }: SeedTable): string {
+  assertColumnsExist(table, rows);
+
+  // Column order comes from the first row: the builders all produce the same
+  // shape, and deriving it avoids maintaining a second list that can drift.
+  const allColumns = Object.keys(rows[0]);
+
+  // An array column that is empty everywhere is dropped so the column default
+  // applies. A column that is empty in some rows but populated in others cannot
+  // be handled that way, and emitting it would produce a bare ARRAY[] that the
+  // database rejects with no useful message — so fail loudly here instead, at
+  // generation time, where the error can name the column.
+  const mixed = mixedEmptyArrayColumns(rows, allColumns);
+  const uncastable = mixed.filter((column) => !elementTypeFor(table, column));
+  if (uncastable.length) {
+    problems.push(
+      `${table}: mixed empty array column(s) ${uncastable.join(", ")} with no known element type`,
+    );
+  }
+
+  const drop = new Set(emptyArrayColumns(rows, allColumns));
+  const columns = allColumns.filter((c) => !drop.has(c));
+
+  const tuples = rows.map((row) => {
+    const values = columns.map((column) =>
+      literal(row[column], elementTypeFor(table, column)),
+    );
+    return `  (${values.join(", ")})`;
+  });
+
+  // Re-running should be a no-op rather than a duplicate-key failure, matching
+  // what the client-side upsert does.
+  const target = conflict.split(",").map((c) => c.trim()).filter(Boolean);
+  const updates = columns.filter((c) => !target.includes(c));
+  const conflictAction = target.length
+    ? updates.length
+      ? `on conflict (${target.join(", ")}) do update set ${updates
+          .map((c) => `${c} = excluded.${c}`)
+          .join(", ")}`
+      : `on conflict (${target.join(", ")}) do nothing`
+    : "";
+
+  // A table with no key of its own cannot be upserted. Clearing exactly the
+  // parents this file writes makes the run idempotent, and scoping it to those
+  // parents is what keeps it from touching rows created through the UI.
+  const prelude = childOf
+    ? [
+        `-- ${table}: no natural key, so clear the rows being replaced`,
+        `delete from public.${table} where ${childOf} in (${[
+          ...new Set(rows.map((row) => row[childOf]).filter(Boolean)),
+        ]
+          .map((v) => literal(v))
+          .join(", ")});`,
+        "",
+      ]
+    : [];
+
+  const notes = [
+    ...(drop.size ? [`-- ${drop.size} all-empty array column(s) omitted, defaults apply`] : []),
+  ];
+
+  return [
+    `-- ${table} (${rows.length} rows)`,
+    ...notes,
+    ...prelude,
+    `insert into public.${table} (${columns.join(", ")}) values`,
+    `${tuples.join(",\n")}`,
+    conflictAction ? `${conflictAction};` : ";",
+    "",
+  ].join("\n");
+}
+
+function renderSqlFile(tables: SeedTable[]): string {
+  const total = tables.reduce((n, t) => n + t.rows.length, 0);
+  const stamp = new Date().toISOString();
+
+  return [
+    `-- CREAM — seed data`,
+    `--`,
+    `-- Generated by \`npm run db:seed:sql\` from src/lib/data/seed-provider.`,
+    `-- Do not edit by hand: regenerate instead, or the next run will drift.`,
+    `--`,
+    `--   ${tables.length} tables, ${total} rows. ${stamp}`,
+    `--`,
+    `-- Paste into the Supabase SQL editor and run. Safe to re-run — every`,
+    `-- statement is an upsert, or a scoped delete followed by an insert.`,
+    `--`,
+    `-- Wrapped in one transaction: if any statement fails, nothing is written,`,
+    `-- rather than leaving a half-populated graph that fails every foreign key`,
+    `-- in the next request.`,
+    `--`,
+    `-- To remove it again, run supabase/unseed.sql.`,
+    "",
+    "begin;",
+    "",
+    ...tables.map(renderTable),
+    "commit;",
+    "",
+  ].join("\n");
+}
+
+/**
+ * The inverse: remove everything seed.sql writes.
+ *
+ * Deletes in reverse dependency order so a parent is never removed while a
+ * child still references it, and uses `cascade` as a backstop rather than the
+ * mechanism — being explicit means the order is correct on its own terms.
+ *
+ * This deletes the seed rows *and* any row created through the UI in the same
+ * tables. There is no dataset discriminator in the schema yet, so the two cannot
+ * be told apart; scoping would need a `dataset` column, which is tracked as
+ * P1-2 in reference/floating-tasks.md. Treat this as a demo-project operation.
+ */
+function renderUnseedFile(tables: SeedTable[]): string {
+  const order = [...tables].reverse();
+
+  return [
+    `-- CREAM — remove the demo dataset`,
+    `--`,
+    `-- Generated alongside supabase/seed.sql. Reverses it exactly: the same tables,`,
+    `-- deleted in reverse dependency order.`,
+    `--`,
+    `--   ${order.length} tables. ${new Date().toISOString()}`,
+    `--`,
+    `-- WARNING — this removes every row in these tables, including briefs and`,
+    `-- accounts created through the UI while the demo data was loaded. The schema`,
+    `-- has no dataset discriminator, so seed rows and real rows are not yet`,
+    `-- distinguishable. See P1-2 in reference/floating-tasks.md.`,
+    `--`,
+    `-- On a demo project this is the expected way to switch the site back to an`,
+    `-- empty state. On a project holding real work, do not run it.`,
+    "",
+    "begin;",
+    "",
+    ...order.map((t) => `delete from public.${t.table} cascade;`),
+    "commit;",
+    "",
+  ].join("\n");
+}
+
+main()
+  .then(async () => {
+    if (!EMIT_SQL) return;
+
+    // Validate the whole plan before rendering. renderTable also reports, but
+    // by then the file is half-written and the exit code has not been set.
+    for (const entry of plan) assertColumnsExist(entry.table, entry.rows);
+
+    if (problems.length) {
+      console.error(`\n  ${problems.length} problem(s) between the seed and the schema:\n`);
+      for (const p of problems) console.error(`    x  ${p}\n`);
+      console.error("  Nothing was written. Fix and regenerate.\n");
+      process.exit(1);
+    }
+
+    const { writeFileSync, mkdirSync } = await import("node:fs");
+    const { join } = await import("node:path");
+    const outDir = join(process.cwd(), "supabase");
+    mkdirSync(outDir, { recursive: true });
+    const file = join(outDir, "seed.sql");
+    writeFileSync(file, renderSqlFile(plan), "utf8");
+    const rows = plan.reduce((n, t) => n + t.rows.length, 0);
+    console.log(`  Wrote ${file} — ${plan.length} tables, ${rows} rows.`);
+
+    const unseed = join(outDir, "unseed.sql");
+    writeFileSync(unseed, renderUnseedFile(plan), "utf8");
+    console.log(`  Wrote ${unseed} — ${plan.length} deletes.`);
+  })
+  .catch((error) => {
+    console.error(`\n  Seed failed: ${error.message}\n`);
+    process.exit(1);
+  });

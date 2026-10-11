@@ -75,8 +75,43 @@ supabase db push
 
 ### 1.5 Load the seed data
 
+Two ways. The SQL route needs no credentials at all and is the safer default.
+
+**Paste into the Supabase SQL editor** — no service role key required:
+
+| File | What it does |
+| --- | --- |
+| `supabase/seed.sql` | Populates 45 tables, 1250 rows |
+| `supabase/unseed.sql` | Removes all of it |
+
+Paste `seed.sql` into the SQL editor and run. It is one transaction, so a
+failure writes nothing rather than leaving a half-populated graph. Re-running is
+safe: every statement is an upsert, or a scoped delete followed by an insert.
+
+To go back to an empty state, paste `unseed.sql`. **It deletes every row in
+those tables, including anything created through the UI** — the schema has no
+dataset discriminator yet, so seed rows and real rows cannot be told apart. On a
+demo project that is what you want; on a project holding real work, do not run
+it. (Tracked as P1-2 in `reference/floating-tasks.md`.)
+
+Both files are generated, not hand-written:
+
 ```bash
-# needs NEXT_PUBLIC_SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY in .env.local
+npm run db:seed:sql    # regenerate seed.sql + unseed.sql
+npm run check:sql      # validate them without a database
+```
+
+`check:sql` is worth running before pasting. It verifies the transaction
+wrapper, balanced parens, closed string literals, schema-qualified inserts,
+that every insert is an upsert or preceded by a scoped delete, and that each
+insert has as many values as columns. It cannot check semantics — only a real
+Postgres can — but it catches the mechanical failures before you paste 1250 rows
+into a web editor.
+
+**Or post it from the CLI**, which needs `NEXT_PUBLIC_SUPABASE_URL` and
+`SUPABASE_SERVICE_ROLE_KEY` in `.env.local`:
+
+```bash
 npm run db:seed
 ```
 
