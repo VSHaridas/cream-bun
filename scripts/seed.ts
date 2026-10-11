@@ -19,6 +19,10 @@ import { TOOLS, MODELS, SKILL_TAXONOMY, SPECIALIZATIONS } from "../src/lib/domai
 import { CONTENT_TYPES, CONTENT_TYPE_META, ASPECT_RATIOS } from "../src/lib/domain/types";
 import { CHANNELS, REGIONS } from "../src/lib/domain/taxonomy";
 import { slugify } from "../src/lib/utils";
+import {
+  readSchema as readSchemaTables,
+  foreignKeysOf,
+} from "./lib/schema-reader";
 
 const URL = process.env.NEXT_PUBLIC_SUPABASE_URL?.trim();
 const KEY = process.env.SUPABASE_SERVICE_ROLE_KEY?.trim();
@@ -410,12 +414,27 @@ async function main() {
     "creator_id",
   );
 
-  await upsert(
+  // One row per (creator, language, offering): the primary key is all three.
+// `offering` is 'speaks' for what the creator works in, 'offered' for what they
+// can dub into — both are real rows, and collapsing them into one would lose the
+// distinction the discovery facet filters on.
+await upsert(
     "creator_languages",
-    s.creators.flatMap((c) =>
-      c.languages.map((l, i) => ({ creator_id: c.id, language: l, position: i })),
-    ),
-    "creator_id,language",
+    s.creators.flatMap((c) => [
+      ...c.languages.map((l, i) => ({
+        creator_id: c.id,
+        language: l,
+        offering: "speaks",
+        position: i,
+      })),
+      ...c.languagesOffered.map((l, i) => ({
+        creator_id: c.id,
+        language: l,
+        offering: "offered",
+        position: i,
+      })),
+    ]),
+    "creator_id,language,offering",
   );
 
   await upsert(
@@ -490,7 +509,11 @@ async function main() {
     "creator_id,workflow_id",
   );
 
-  await upsert(
+  // The primary key is `id`, a uuid we never had — there is no slug on this
+// table. `identity_verifications_single_owner` is a CHECK, not a unique
+// constraint, so it cannot be an on-conflict target either. Cleared by creator
+// instead, same as the other child tables without a usable key.
+await upsert(
     "identity_verifications",
     s.creators.map((c) => ({
       creator_id: c.id,
@@ -505,6 +528,7 @@ async function main() {
       assurance_level: c.identity.assuranceLevel,
       document: {},
     })),
+    "",
     "creator_id",
   );
 
@@ -916,27 +940,7 @@ function literal(value: unknown, arrayCast?: string | null): string {
   return `'${escape(String(value))}'`;
 }
 
-/**
- * Columns we are allowed to cast an empty array to.
- *
- * `ARRAY[]` is not valid SQL on its own — it needs a cast, and the cast has to
- * name the element type. Postgres cannot infer the target from inside a VALUES
- * clause, so we have to know it.
- *
- * Every array column in `0001_schema.sql` is `text[]`; there are no array-typed
- * enums. That is a property of the schema, not of this file, so it is verified
- * against the migration at generation time rather than trusted — if someone
- * adds `model_id[]` later, `npm run db:seed:sql` fails here and names the
- * column, instead of emitting SQL that the database rejects 400 statements in.
- */
-function assertSchemaArraysAreText(readSql: string) {
-  const offenders = new Set<string>();
-  for (const match of readSql.matchAll(/^\s+(\w+)\s+(\w+)\[\]/gm)) {
-    const [, column, type] = match;
-    if (type !== "text") offenders.add(`${column} ${type}[]`);
-  }
-  return offenders;
-}
+
 
 /**
  * Columns that are an empty array in every row, and so can simply be left out.
@@ -991,9 +995,12 @@ function elementTypeFor(table: string, column: string) {
  * and a mismatch between the two is an error here instead of a 400 from
  * Postgres several hundred statements in.
  */
+/** Array columns, and the tables whose array elements we can name a type for. */
 const ARRAY_COLUMNS = new Set<string>();
 const TABLE_COLUMNS = new Map<string, Set<string>>();
 const SCHEMA_TABLES = new Map<string, { columns: Set<string>; foreignKeys: Fk[] }>();
+const UNIQUE_KEYS = new Map<string, Set<string[]>>();
+const PARTIAL_KEYS = new Map<string, string>();
 const SCHEMA_ENUMS = new Set<string>();
 
 interface Fk {
@@ -1003,63 +1010,57 @@ interface Fk {
   parentColumn: string;
 }
 
+/**
+ * Loads the migration and indexes it by the three questions the seed cannot
+ * answer on its own: does this column exist, does this foreign key resolve, and
+ * is there a unique constraint over these columns.
+ */
 function readSchema(sql: string) {
-  // How each parent column is named. All text-keyed reference tables in this
-  // schema use `id`; the rest are addressed by slug.
-  const parentKeyColumn = (table: string) =>
-    ["models", "tools", "skills", "content_types", "aspect_ratios"].includes(table)
-      ? "id"
-      : "id";
-
-  for (const match of sql.matchAll(
-    /create table if not exists public\.(\w+) \(([\s\S]*?)\n\);/g,
-  )) {
-    const [, table, body] = match;
-    const columns = new Set<string>();
-    for (const line of body.split("\n")) {
-      const column = line
-        .trim()
-        .match(
-          /^(\w+)\s+(?:text|bigint|smallint|integer|numeric|boolean|uuid|jsonb|timestamptz|date|timestamp|vector\(\d+\)|tsvector|\w+(?:\[\])?)\b/,
-        );
-      if (column) columns.add(column[1]);
+for (const [, table] of readSchemaTables(sql)) {
+    TABLE_COLUMNS.set(table.table, table.columns);
+    UNIQUE_KEYS.set(table.table, table.uniqueGroups);
+    SCHEMA_TABLES.set(table.table, {
+      columns: table.columns,
+      foreignKeys: foreignKeysOf(table.body),
+    });
+    for (const column of table.body.matchAll(/^\s+(\w+)\s+text\[\]/gm)) {
+      ARRAY_COLUMNS.add(`${table.table}.${column[1]}`);
     }
-
-    const foreignKeys: Fk[] = [];
-    for (const line of body.split("\n")) {
-      const fk = line.match(
-        /^\s+(\w+)\s+[\w\s(),]+\s+references\s+public\.(\w+)\s*\(\s*(\w+)\s*\)/,
-      );
-      if (fk) {
-        foreignKeys.push({
-          column: fk[1],
-          parent: fk[2],
-          parentColumn: parentKeyColumn(fk[2]),
-        });
-      }
-    }
-
-    TABLE_COLUMNS.set(table, columns);
-    SCHEMA_TABLES.set(table, { columns, foreignKeys });
-    for (const column of body.matchAll(/^\s+(\w+)\s+text\[\]/gm)) {
-      ARRAY_COLUMNS.add(`${table}.${column[1]}`);
-    }
+    if (table.partials.length) PARTIAL_KEYS.set(table.table, table.partials.join("; "));
   }
 
   for (const match of sql.matchAll(/create type public\.(\w+) as enum/g)) {
     SCHEMA_ENUMS.add(match[1]);
   }
+
+  const nonText = assertSchemaArraysAreText(sql);
+  if (nonText.size) {
+    throw new Error(
+      `The schema now has non-text array column(s): ${[...nonText].join(", ")}.\n` +
+        `Rendering an empty array into one of those needs a different cast, and\n` +
+        `guessing would produce SQL that fails at the database.`,
+    );
+  }
 }
 
 /**
- * Fails when a row references a column the table does not have.
+ * Columns we are allowed to cast an empty array to.
  *
- * This is not a theoretical check. `engagements.contract_ids` was being written
- * against a table that has no such column, and the client-side seeder would
- * have failed on it for anyone who ran `npm run db:seed` against a real
- * project. Validating here means the SQL file is known-good before it is
- * pasted, rather than discovered halfway through a 1250-row transaction.
+ * Every array column in `0001_schema.sql` is `text[]`; there are no array-typed
+ * enums. That is a property of the schema, not of this file, so it is verified
+ * against the migration at generation time rather than trusted — if someone adds
+ * `model_id[]` later, generation fails here and names the column instead of
+ * emitting SQL the database rejects 400 statements in.
  */
+function assertSchemaArraysAreText(readSql: string) {
+  const offenders = new Set<string>();
+  for (const match of readSql.matchAll(/^\s+(\w+)\s+(\w+)\[\]/gm)) {
+    const [, column, type] = match;
+    if (type !== "text") offenders.add(`${column} ${type}[]`);
+  }
+  return offenders;
+}
+
 function assertColumnsExist(table: string, rows: Record<string, unknown>[]) {
   const known = TABLE_COLUMNS.get(table);
   if (!known) {
@@ -1099,6 +1100,47 @@ function assertColumnsExist(table: string, rows: Record<string, unknown>[]) {
  * Skipped for parents that are not text-keyed, where the join is on a uuid we
  * only learn at insert time.
  */
+/**
+ * Fails when an `on conflict` target has no matching unique constraint.
+ *
+ * Postgres answers this with 42P10 and names the constraint but not the
+ * statement, which in a 1250-row file pasted into a web editor means counting
+ * statements by hand. Every conflict target is checked against the keys the
+ * schema actually declares.
+ *
+ * Found the hard way: `creator_languages` is keyed
+ * `(creator_id, language, offering)` — the distinction between languages a
+ * creator speaks and ones they can dub into — and the seeder said
+ * `on conflict (creator_id, language)`.
+ *
+ * Partial indexes are called out separately, because Postgres only infers one
+ * when the clause repeats its predicate. That is not currently correctable
+ * here, so it is reported as a specific problem rather than a generic miss.
+ */
+function assertConflictTargets(tables: SeedTable[]) {
+  for (const { table, conflict } of tables) {
+    if (!conflict) continue;
+    const wanted = conflict.split(",").map((c) => c.trim());
+    const have = UNIQUE_KEYS.get(table) ?? new Set<string[]>();
+
+    const ok = [...have].some(
+      (group) => group.length === wanted.length && wanted.every((c) => group.includes(c)),
+    );
+    if (ok) continue;
+
+    const partial = PARTIAL_KEYS.get(table);
+    problems.push(
+      `${table}: on conflict (${wanted.join(", ")}) has no matching unique constraint.` +
+        (partial
+          ? ` It has partial unique indexes (${partial}); Postgres only infers one when the ` +
+            `clause repeats the predicate, so this needs a delete-then-insert instead.`
+          : ` The schema declares: ${
+              [...have].map((g) => `(${g.join(", ")})`).join(" ") || "none"
+            }`),
+    );
+  }
+}
+
 function assertForeignKeysResolve(tables: SeedTable[]) {
   const byTable = new Map(tables.map((t) => [t.table, t]));
 
@@ -1448,6 +1490,7 @@ main()
     // by then the file is half-written and the exit code has not been set.
     for (const entry of plan) assertColumnsExist(entry.table, entry.rows);
     assertForeignKeysResolve(plan);
+    assertConflictTargets(plan);
 
     if (problems.length) {
       console.error(`\n  ${problems.length} problem(s) between the seed and the schema:\n`);

@@ -15,6 +15,7 @@
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { join } from "node:path";
+import { readSchema } from "./lib/schema-reader";
 
 const ROOT = process.cwd();
 const SEED = join(ROOT, "supabase", "seed.sql");
@@ -367,9 +368,51 @@ if (caughtPhantomColumn) {
   fail("the column check did not fire when aspect_ratios.width was restored");
 }
 
-console.log(
-  failed === 0
-    ? "\n  seed.sql is well-formed"
-    : `\n  ${failed} problem(s) — do not paste this into the SQL editor yet`,
+/* ── on-conflict targets must exist in the schema ────────────────────────── */
+
+// Postgres rejects a target with no matching unique constraint using 42P10,
+// naming the constraint but not the statement. In a file this size that means
+// counting statements by hand, so the targets are checked here — and again
+// inside the generator, where the failure is caught before anything is written.
+const conflictTargets = [...seed.matchAll(/on conflict \(([^)]+)\)/gi)].map((m) =>
+  m[1]
+    .split(",")
+    .map((c) => c.trim()),
 );
-process.exit(failed === 0 ? 0 : 1);
+
+const declaredKeys = readSchema(
+  readFileSync(join(ROOT, "supabase", "migrations", "0001_schema.sql"), "utf8"),
+);
+
+const badTargets: string[] = [];
+
+// Walk statement by statement so a target is checked against its own table.
+for (const stmt of seed.replace(/\r/g, "").split(/;\s*\n/)) {
+  const insert = stmt.match(/insert into public\.(\w+)/i);
+  const conflict = stmt.match(/\bon conflict \(([^)]+)\)/i);
+  if (!insert || !conflict) continue;
+  const table = insert[1];
+  const wanted = conflict[1].split(",").map((c) => c.trim());
+  const have = declaredKeys.get(table)?.uniqueGroups ?? new Set<string[]>();
+  const ok = [...have].some(
+    (group) => group.length === wanted.length && wanted.every((c) => group.includes(c)),
+  );
+  if (!ok) {
+    const partials = declaredKeys.get(table)?.partials ?? [];
+    badTargets.push(
+      `${table} (${wanted.join(", ")})` +
+        (partials.length ? ` — partial indexes exist: ${partials.join("; ")}` : ""),
+    );
+  }
+}
+
+if (badTargets.length === 0) {
+  pass(`all ${conflictTargets.length} on-conflict targets exist in the schema`);
+} else {
+  fail(
+    `on-conflict target(s) with no matching unique constraint: ${badTargets.join(", ")}. ` +
+      `Postgres will reject these with 42P10.`,
+  );
+}
+
+/* ── the generator's own guards must actually fire ───────────────────────── */
