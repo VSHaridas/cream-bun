@@ -11,7 +11,8 @@ import {
   ScanSearch,
   FingerprintIcon,
 } from "lucide-react";
-import { getCreators, getPortfolio, getWorkflows } from "@/lib/data";
+import { getCreators, getPortfolio, getWorkflows, activeSource } from "@/lib/data";
+import { DatasetEmpty, missingTables } from "@/components/system/dataset-empty";
 import { createTrustEngine } from "@/lib/domain/trust";
 import { integrationStatus } from "@/lib/integrations/registry";
 import { inr } from "@/lib/utils";
@@ -35,9 +36,20 @@ export default async function LandingPage() {
     portfolio,
     workflows: new Map(workflows.map((w) => [w.id, w])),
   });
+  // The hero cover is a real portfolio piece, picked by the trust engine rather
+  // than hardcoded. With a connected-but-unseeded database there is no piece to
+  // pick and `.find(...)` returns undefined — a non-null assertion would only
+  // move the crash from here to the next line.
+const empty = missingTables({ creators, portfolio, workflows });
+  if (empty.length) return <DatasetEmpty missing={empty} source={activeSource()} />;
+
   const featured = creators.slice(0, 6);
   const elite = [...creators].sort((a, b) => trust.assess(b).score - trust.assess(a).score)[0];
-  const cover = portfolio.find((p) => p.id === elite.portfolioIds[0])!;
+  // `elite.portfolioIds` can be empty even when the creators table has rows — a
+  // creator with no uploaded work has no ids to point at. Fall back to any
+  // piece rather than asserting one exists.
+  const cover =
+    portfolio.find((p) => p.id === elite.portfolioIds[0]) ?? portfolio.find((p) => p.creatorId === elite.id) ?? portfolio[0];
 
   return (
     <>

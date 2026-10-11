@@ -12,6 +12,8 @@ import {
   getWorkflows,
 } from "@/lib/data";
 import { DeckClient } from "./deck-client";
+import { activeSource } from "@/lib/data";
+import { DatasetEmpty, missingTables } from "@/components/system/dataset-empty";
 
 export default async function DeckPage() {
   const [
@@ -35,6 +37,21 @@ export default async function DeckPage() {
     getProvenance(),
     getContracts(),
   ]);
+
+  // The deck quotes real creators, briefs and escrows rather than illustrative
+  // constants, and DeckClient reads `portfolio[0]` directly.
+  const empty = missingTables({
+    creators,
+    portfolio,
+    workflows,
+    briefs,
+    brands,
+    offers,
+    escrows,
+    provenance_records: provenance,
+    contracts,
+  });
+  if (empty.length) return <DatasetEmpty missing={empty} source={activeSource()} />;
 
   return (
     <DeckClient

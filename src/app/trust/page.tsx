@@ -23,6 +23,8 @@ import { CHECKOUT_METHODS, ESCROW_POLICY, payoutBreakdown } from "@/lib/integrat
 import { PROVENANCE_LAYERS, envelopeBits, visibleBurnIn } from "@/lib/integrations/provenance";
 import { integrationStatus } from "@/lib/integrations/registry";
 import { getContracts, getCreators, getEscrows, getProvenance } from "@/lib/data";
+import { activeSource } from "@/lib/data";
+import { DatasetEmpty, missingTables } from "@/components/system/dataset-empty";
 
 import { Badge, Button, Label, Meter, Panel, Stat } from "@/components/ui/primitives";
 import { Reveal, Section, SectionHead, Stagger, StaggerItem } from "@/components/shared/motion";
@@ -91,8 +93,21 @@ export default async function TrustArchitecturePage() {
     getCreators(),
   ]);
 
-  const integrations = integrationStatus();
+const integrations = integrationStatus();
   const live = integrations.filter((i) => i.mode === "live").length;
+
+  // This page quotes a real escrow, a real contract and a real provenance
+  // envelope rather than illustrating them with constants. Those rows are
+  // guaranteed under the bundled seed and absent from a connected-but-unseeded
+  // database, so the page states which tables are empty instead of
+  // dereferencing `escrows[0].amountInr` and dying.
+  const empty = missingTables({
+    provenance_records: provenanceRecords,
+    escrows,
+    contracts,
+    creators,
+  });
+  if (empty.length) return <DatasetEmpty missing={empty} source={activeSource()} />;
 
   const record = provenanceRecords[0];
   const escrow = escrows[0];

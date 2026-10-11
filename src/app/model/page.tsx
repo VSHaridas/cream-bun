@@ -32,6 +32,8 @@ import {
   getReviews,
   getWorkflows,
 } from "@/lib/data";
+import { activeSource } from "@/lib/data";
+import { DatasetEmpty, missingTables } from "@/components/system/dataset-empty";
 import {
   CHANNELS,
   INDUSTRIES,
@@ -267,13 +269,32 @@ export default async function ModelNotePage() {
     workflows: new Map(workflows.map((w) => [w.id, w])),
   });
 
+  // The data-model note walks one concrete brief through the whole graph:
+  // brief, creator, offer, escrow, provenance record, contract, engagement and
+  // one specific revision round. Every one of those is indexed at position 0 or
+  // 1, which is only safe when the dataset is populated.
+  const empty = missingTables({
+    briefs,
+    creators,
+    offers,
+    escrows,
+    provenance_records: provenance,
+    contracts,
+    engagements,
+    workflows,
+  });
+  if (empty.length) return <DatasetEmpty missing={empty} source={activeSource()} />;
+
   const MONSOON = briefs[0];
   const AARAV = creators[0];
   const ACCEPTED = offers[0];
   const ESCROW = escrows[0];
   const PROV = provenance[0];
-  const START_CONTRACT = contracts.find((c) => c.kind === "engagement-start")!;
-  const ROUND = engagements[0].rounds[1];
+  const START_CONTRACT =
+    contracts.find((c) => c.kind === "engagement-start") ?? contracts[0];
+  // The page illustrates a *second* round — the revision step is the point of
+  // the note. An engagement with a single round cannot illustrate it.
+  const ROUND = engagements[0].rounds[1] ?? engagements[0].rounds[0];
   const STAGE = workflows[0].stages;
 
   const ELITE = [...creators].sort((a, b) => trust.assess(b).score - trust.assess(a).score)[0];
@@ -286,7 +307,11 @@ export default async function ModelNotePage() {
     0,
   );
   const deliverableCount = MONSOON.deliverables.reduce((s, d) => s + d.quantity, 0);
-  const stillCount = MONSOON.deliverables.find((d) => d.id === "d3")!.quantity;
+  // "d3" is a seeded literal. A brief created in the app will not have it, so
+  // fall back to the largest still rather than asserting a row exists.
+  const stillCount =
+    MONSOON.deliverables.find((d) => d.id === "d3")?.quantity ??
+    Math.max(0, ...MONSOON.deliverables.map((d) => d.quantity));
 
   return (
     <>

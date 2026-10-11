@@ -23,9 +23,46 @@ import { supabaseCapability } from "@/lib/env";
 
 let cachedProvider: DataProvider | null = null;
 
+/**
+ * A provider that answers every query with nothing.
+ *
+ * Exists so the "connected but empty" case is reachable without a live project.
+ * That case is not hypothetical: it is what a fresh Supabase project looks like
+ * after the migration is applied but before `npm run db:seed` runs, and it is
+ * the state that produced three 500s in production.
+ */
+const emptyProvider: DataProvider = {
+  name: "supabase",
+  writable: true,
+  load: async () => ({
+    creators: [],
+    portfolio: [],
+    workflows: [],
+    brands: [],
+    briefs: [],
+    sessions: [],
+    offers: [],
+    contracts: [],
+    engagements: [],
+    escrows: [],
+    provenance: [],
+    reviews: [],
+  }),
+};
+
+function selectProvider(): DataProvider {
+  // Server-only seam. Lets a deployment pin the dataset explicitly, and lets
+  // the empty-dataset guard paths be exercised in CI without a Supabase
+  // project. Not NEXT_PUBLIC_, so it never reaches the client bundle.
+  const forced = process.env.CREAM_FORCE_DATASET?.trim().toLowerCase();
+  if (forced === "empty") return emptyProvider;
+  if (forced === "seed") return seedProvider;
+  return supabaseCapability().live ? supabaseProvider : seedProvider;
+}
+
 export function getProvider(): DataProvider {
   if (cachedProvider) return cachedProvider;
-  cachedProvider = supabaseCapability().live ? supabaseProvider : seedProvider;
+  cachedProvider = selectProvider();
   return cachedProvider;
 }
 
@@ -58,8 +95,27 @@ export interface DatastoreStatus {
 }
 
 /**
- * Request-scoped result of the load, degraded or not.
+ * The single load, memoised for the life of the render.
  *
+ * Both `getSnapshot` and `getDatastoreStatus` used to call `provider.load()`
+ * themselves. React `cache()` memoises per function, not per underlying call,
+ * so the shell's status check and the page's data read each triggered the full
+ * fifteen-table `Promise.all` — thirty round trips per request instead of
+ * fifteen. Every page also awaits the status check before its own data, so the
+ * two ran serially as well as redundantly.
+ */
+const loadOnce = cache(
+  async (): Promise<{ snapshot: DataSnapshot | null; error: string | null }> => {
+    const provider = getProvider();
+    try {
+      return { snapshot: await provider.load(), error: null };
+    } catch (error) {
+      return { snapshot: null, error: error instanceof Error ? error.message : String(error) };
+    }
+  },
+);
+
+/**
  * A configured datastore that cannot be read — migration not applied, project
  * paused, network blip — must not take the whole site down with a 500. But it
  * also must not quietly present bundled seed data as though it were the
@@ -69,28 +125,27 @@ export interface DatastoreStatus {
  */
 export const getDatastoreStatus = cache(async (): Promise<DatastoreStatus> => {
   const provider = getProvider();
-  try {
-    await provider.load();
-    return { degraded: false, reason: null, source: provider.name };
-  } catch (error) {
-    const reason = error instanceof Error ? error.message : String(error);
-    console.error(`[cream] datastore "${provider.name}" unavailable — serving bundled seed data:`, reason);
-    return { degraded: true, reason, source: "seed" };
+  const { error } = await loadOnce();
+  if (error) {
+    console.error(
+      `[cream] datastore "${provider.name}" unavailable — serving bundled seed data:`,
+      error,
+    );
+    return { degraded: true, reason: error, source: "seed" };
   }
+  return { degraded: false, reason: null, source: provider.name };
 });
 
 export const getSnapshot = cache(async (): Promise<DataSnapshot> => {
   const provider = getProvider();
-  try {
-    return await provider.load();
-  } catch (error) {
-    if (provider.name === "seed") throw error;
-    console.error(
-      `[cream] datastore "${provider.name}" unavailable — serving bundled seed data:`,
-      error instanceof Error ? error.message : error,
-    );
-    return (await import("./seed-provider")).seedSnapshot;
-  }
+  const { snapshot, error } = await loadOnce();
+  if (snapshot) return snapshot;
+  // The seed adapter is the last line of defence. If it fails there is nothing
+  // left to serve, so surface the original datastore error rather than a
+  // confusing one from the fallback.
+  if (provider.name === "seed") throw new Error(error ?? "seed provider returned no snapshot");
+  const { seedSnapshot } = await import("./seed-provider");
+  return seedSnapshot;
 });
 
 export const getIndexed = cache(async () => withIndexes(await getSnapshot()));
