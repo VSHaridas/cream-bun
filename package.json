@@ -13,7 +13,8 @@
     "launch": "node scripts/launch.mjs",
     "db:seed": "tsx scripts/seed.ts",
     "check:url": "tsx scripts/check-project-url.ts",
-    "check:empty": "tsx scripts/check-empty-dataset.ts"
+    "check:empty": "tsx scripts/check-empty-dataset.ts",
+    "check:export": "tsx scripts/check-brief-export.ts"
   },
   "dependencies": {
     "@google/genai": "^2.28.0",

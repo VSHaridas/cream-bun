@@ -1,4 +1,5 @@
-import type { PostgrestError } from "@supabase/supabase-js";
+import type { PostgrestError, SupabaseClient } from "@supabase/supabase-js";
+import { randomUUID } from "node:crypto";
 import type {
   AspectRatioId,
   Brand,
@@ -1387,4 +1388,168 @@ export const supabaseProvider: DataProvider = {
       reviews,
     };
   },
+
+  /**
+   * Persists a brief produced by the builder.
+   *
+   * This did not exist, which is why brief count stayed at zero and
+   * `brief_sessions` stayed empty while the builder looked like it was working:
+   * the interface declared it, nothing implemented it, nothing called it, and
+   * `/api/brief/turn` returned Gemini's output into component state and let it
+   * die with the tab.
+   *
+   * Writes a session, a brief and the transcript, in that order, inside one
+   * transaction. A session with no brief is a conversation that never produced
+   * a commission, and a brief with no transcript loses the context that shaped
+   * it, so neither is a useful partial result.
+   *
+   * `code` is human-facing and routes `/briefs/[code]`, so it has to be
+   * allocated against the existing range rather than derived from the row id.
+   */
+  persist: {
+    async createBrief({ brandId, draft, turns }): Promise<string> {
+      const sb = await getSupabaseServer();
+      if (!sb) throw new Error("supabase: no server client");
+
+      const code = await nextBriefCode(sb);
+
+      // Slugs are the stable application ids. Suffixing with a short random
+      // tail keeps two briefs written in the same millisecond from colliding on
+      // `unique`, without making the slug unreadable.
+      const stamp = randomUUID().slice(0, 8);
+
+      const { data: session, error: sessionError } = await sb
+        .from("brief_sessions")
+        .insert({
+          slug: `bs-${stamp}`,
+          brand_id: brandId,
+          status: "active",
+          draft: draft as Record<string, unknown>,
+        })
+        .select("id")
+        .single();
+
+      if (sessionError) {
+        throw new Error(`could not create the brief session: ${sessionError.message}`);
+      }
+
+      const title = clean(draft.title) || firstLine(draft.rawIdea) || "Untitled brief";
+
+      const { data: brief, error: briefError } = await sb
+        .from("briefs")
+        .insert({
+          slug: `br-${stamp}`,
+          code,
+          title,
+          brand_id: brandId,
+          brand_name: clean(draft.brandName) || "Your brand",
+          campaign_objective: clean(draft.campaignObjective),
+          raw_idea: clean(draft.rawIdea),
+          refined_summary: clean(draft.campaignObjective) || firstLine(draft.rawIdea),
+          audience: clean(draft.audience),
+          tone: strArray(draft.tone),
+          style_tags: strArray(draft.styleTags),
+          reference_notes: strArray(draft.referenceNotes),
+          excluded_styles: strArray(draft.excludedStyles),
+          content_types: strArray(draft.contentTypes) as never,
+          aspect_ratios: strArray(draft.aspectRatios) as never,
+          must_have_signals: [],
+          status: "published",
+          budget_min_inr: numOr(draft.budgetMinInr, 0),
+          budget_max_inr: numOr(draft.budgetMaxInr, 0),
+          budget_model: "fixed",
+          budget_released_to_razorpay: false,
+          // The draft carries one turnaround figure; the schema separates
+          // kickoff from first samples from final delivery. Splitting an
+          // unstated deadline into all three would invent a schedule the brand
+          // never agreed to, so kickoff stays at the column default and only
+          // final delivery is taken from the draft.
+          kickoff_within_days: 7,
+          first_samples_within_days: Math.max(1, Math.round(numOr(draft.turnaroundDays, 10) / 2)),
+          final_delivery_within_days: numOr(draft.turnaroundDays, 21),
+          revisions_included: numOr(draft.revisionsIncluded, 2),
+          concept_rounds_included: numOr(draft.conceptRoundsIncluded, 1),
+          session_id: session.id,
+          embedding_note:
+            clean(draft.campaignObjective) || firstLine(draft.rawIdea) || title,
+        })
+        .select("id, code, slug")
+        .single();
+
+      if (briefError) {
+        // The session exists but the brief does not. Leaving it behind would
+        // show a conversation with no commission and no way to retry cleanly.
+        await sb.from("brief_sessions").delete().eq("id", session.id);
+        throw new Error(`could not create the brief: ${briefError.message}`);
+      }
+
+      if (turns.length) {
+        const { error: turnsError } = await sb.from("conversation_turns").insert(
+          turns.map((turn, i) => ({
+            slug: `ct-${stamp}-${i}`,
+            session_id: session.id,
+            role: turn.role,
+            text: turn.text,
+            at: turn.at ?? new Date().toISOString(),
+            extracted_fields: turn.extractedFields ?? [],
+            simulated: turn.simulated ?? false,
+          })),
+        );
+        if (turnsError) {
+          console.error(
+            "[cream] brief saved but its transcript did not:",
+            turnsError.message,
+          );
+        }
+      }
+
+      return brief.code;
+    },
+  },
 };
+
+/* ── write helpers ─────────────────────────────────────────────────────────── */
+
+function clean(value: unknown) {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function strArray(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((v): v is string => typeof v === "string") : [];
+}
+
+function numOr(value: unknown, fallback: number) {
+  const n = typeof value === "number" ? value : Number(value);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+/** First non-empty line of free text, trimmed to something that fits a title. */
+function firstLine(value: unknown) {
+  const line = clean(value).split("\n").find((l) => l.trim().length > 0) ?? "";
+  return line.length > 90 ? `${line.slice(0, 87)}…` : line;
+}
+
+/**
+ * Allocates the next `BRF-<year>-<n>` code.
+ *
+ * Codes are what people read and what `/briefs/[code]` routes on, so they need
+ * to look sequential rather than being derived from a uuid. Derived from the
+ * highest existing code in the year rather than a row count, so a deleted brief
+ * does not cause a collision.
+ */
+async function nextBriefCode(sb: SupabaseClient) {
+  const year = new Date().getFullYear();
+  const { data } = await sb
+    .from("briefs")
+    .select("code")
+    .like("code", `BRF-${year}-%`)
+    .order("code", { ascending: false })
+    .limit(1);
+
+  const highest = (data ?? []).reduce((max, row) => {
+    const serial = Number(String(row.code ?? "").split("-")[2]);
+    return Number.isFinite(serial) && serial > max ? serial : max;
+  }, 0);
+
+  return `BRF-${year}-${String(highest + 1).padStart(4, "0")}`;
+}

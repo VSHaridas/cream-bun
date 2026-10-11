@@ -13,8 +13,10 @@ import {
   Loader2,
   RotateCcw,
   Sparkles,
+  TriangleAlert,
   Wand2,
 } from "lucide-react";
+import { renderBriefMarkdown, briefAsText, downloadText, copyToClipboard } from "@/lib/brief/export";
 import { ASPECT_RATIOS, CONTENT_TYPE_META } from "@/lib/domain/types";
 import { MISSING_META, type BriefDraft, type MissingField } from "@/lib/llm/contract";
 import { EMPTY_DRAFT, SUGGESTION_POOL, missingFields, progressOf } from "@/lib/llm/reasoner";
@@ -116,6 +118,9 @@ export function BriefBuilder({ brandName }: { brandName: string }) {
   const [model, setModel] = React.useState<string>("");
   const [simulated, setSimulated] = React.useState(true);
   const [published, setPublished] = React.useState(false);
+  const [saving, setSaving] = React.useState(false);
+  const [saved, setSaved] = React.useState<{ code: string; href: string } | null>(null);
+  const [saveError, setSaveError] = React.useState<string>("");
   const scrollRef = React.useRef<HTMLDivElement>(null);
   const textareaRef = React.useRef<HTMLTextAreaElement>(null);
 
@@ -124,6 +129,55 @@ export function BriefBuilder({ brandName }: { brandName: string }) {
   const missing = React.useMemo(() => missingFields(draft), [draft]);
   const progress = React.useMemo(() => progressOf(draft), [draft]);
   const complete = missing.length === 0;
+
+  /**
+   * Writes the brief.
+   *
+   * This used to be `setPublished(true)` — the button showed "Brief published"
+   * and linked to a workspace that contained nothing, because no write path
+   * existed. Now it posts to /api/brief and renders what actually came back.
+   */
+  async function copyBrief(code: string, draft: BriefDraft) {
+    await copyToClipboard(briefAsText(code, draft));
+  }
+
+  function downloadMarkdown(code: string, draft: BriefDraft, turns: Turn[]) {
+    downloadText(code || "brief", renderBriefMarkdown(code, draft, turns));
+  }
+
+  async function publish() {
+    setSaving(true);
+    setSaveError("");
+    setPublished(true);
+    try {
+      const res = await fetch("/api/brief", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ draft, turns }),
+      });
+      const data = await res.json().catch(() => ({}));
+
+      if (!res.ok) {
+        setSaved(null);
+        setSaveError(
+          typeof data.error === "string"
+            ? data.error
+            : `The server refused to save this brief (${res.status}).`,
+        );
+        return;
+      }
+      setSaved({ code: data.code, href: data.href ?? `/briefs/${data.code}` });
+    } catch (error) {
+      setSaved(null);
+      setSaveError(
+        error instanceof Error
+          ? `Could not reach the server: ${error.message}`
+          : "Could not reach the server.",
+      );
+    } finally {
+      setSaving(false);
+    }
+  }
 
   React.useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
@@ -503,13 +557,19 @@ export function BriefBuilder({ brandName }: { brandName: string }) {
                     creator pool — no model in the loop.
                   </p>
                 </div>
-                <Button variant="accent" className="w-full" onClick={() => setPublished(true)}>
+                <Button
+                  variant="accent"
+                  className="w-full"
+                  onClick={publish}
+                  loading={saving}
+                  disabled={saving}
+                >
                   Publish and find creators
                 </Button>
               </div>
             )}
 
-            {published && (
+            {published && saved && (
               <motion.div
                 initial={{ opacity: 0, y: 8 }}
                 animate={{ opacity: 1, y: 0 }}
@@ -517,18 +577,63 @@ export function BriefBuilder({ brandName }: { brandName: string }) {
               >
                 <div className="mb-4 flex items-center gap-2.5">
                   <Wand2 className="size-4 text-mint" />
-                  <span className="text-[13px] font-medium text-ink">Brief published</span>
+                  <span className="text-[13px] font-medium text-ink">
+                    Brief saved as {saved.code}
+                  </span>
                 </div>
                 <p className="text-[12.5px] leading-relaxed text-ink-muted">
-                  Saved as a draft brief in your workspace. The conversation is attached to it
-                  verbatim — the creator will see this exact exchange alongside the restated brief.
+                  Written to Postgres with the conversation attached verbatim — the creator will
+                  see this exact exchange alongside the restated brief.
                 </p>
                 <div className="mt-4 flex flex-col gap-2">
                   <Button asChild variant="primary" size="sm" className="w-full">
-                    <Link href="/briefs">Open the brief</Link>
+                    <Link href={`/briefs/${saved.code}`}>Open the brief</Link>
                   </Button>
+                  <div className="grid grid-cols-2 gap-2">
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => downloadMarkdown(saved.code, draft, turns)}
+                    >
+                      Export .md
+                    </Button>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => copyBrief(saved.code, draft)}
+                    >
+                      Copy as text
+                    </Button>
+                  </div>
                   <Button asChild variant="outline" size="sm" className="w-full">
                     <Link href="/discover">Browse creators meanwhile</Link>
+                  </Button>
+                </div>
+              </motion.div>
+            )}
+
+            {published && !saved && (
+              <motion.div
+                initial={{ opacity: 0, y: 8 }}
+                animate={{ opacity: 1, y: 0 }}
+                className="border-t border-line p-5"
+              >
+                <div className="mb-3 flex items-center gap-2.5">
+                  <TriangleAlert className="size-4 text-caramel" />
+                  <span className="text-[13px] font-medium text-ink">Not saved</span>
+                </div>
+                <p className="text-[12.5px] leading-relaxed text-ink-muted">{saveError}</p>
+                <div className="mt-4 flex flex-col gap-2">
+                  <Button variant="outline" size="sm" className="w-full" onClick={publish}>
+                    Try again
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="w-full"
+                    onClick={() => downloadMarkdown("UNSAVED", draft, turns)}
+                  >
+                    Export anyway
                   </Button>
                 </div>
               </motion.div>
