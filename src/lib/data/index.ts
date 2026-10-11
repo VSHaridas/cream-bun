@@ -50,8 +50,47 @@ export function isWritable() {
  * component above them, so a private record is never serialised into a page
  * a different user requested.
  */
+export interface DatastoreStatus {
+  /** True when the configured datastore could not be read and seed data is standing in. */
+  degraded: boolean;
+  reason: string | null;
+  source: "seed" | "supabase";
+}
+
+/**
+ * Request-scoped result of the load, degraded or not.
+ *
+ * A configured datastore that cannot be read — migration not applied, project
+ * paused, network blip — must not take the whole site down with a 500. But it
+ * also must not quietly present bundled seed data as though it were the
+ * database. So we fall back *and* carry the reason, and the shell renders it.
+ * The distinction that matters: silent fallback is dishonest, loud fallback
+ * with a visible banner is a degraded mode.
+ */
+export const getDatastoreStatus = cache(async (): Promise<DatastoreStatus> => {
+  const provider = getProvider();
+  try {
+    await provider.load();
+    return { degraded: false, reason: null, source: provider.name };
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    console.error(`[cream] datastore "${provider.name}" unavailable — serving bundled seed data:`, reason);
+    return { degraded: true, reason, source: "seed" };
+  }
+});
+
 export const getSnapshot = cache(async (): Promise<DataSnapshot> => {
-  return getProvider().load();
+  const provider = getProvider();
+  try {
+    return await provider.load();
+  } catch (error) {
+    if (provider.name === "seed") throw error;
+    console.error(
+      `[cream] datastore "${provider.name}" unavailable — serving bundled seed data:`,
+      error instanceof Error ? error.message : error,
+    );
+    return (await import("./seed-provider")).seedSnapshot;
+  }
 });
 
 export const getIndexed = cache(async () => withIndexes(await getSnapshot()));

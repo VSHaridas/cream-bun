@@ -25,6 +25,14 @@ const PUBLIC_ROUTES = [
   "/deck",
   "/onboarding",
   "/creators",
+  // The auth routes must be public or an anonymous visitor is redirected to a
+  // page that redirects them again — forever. This is the whole loop: the
+  // guard sends them to /auth/signin, the guard does not recognise /auth/signin
+  // as public, so it appends ?next=/auth/signin and redirects again.
+  "/auth/signin",
+  "/auth/callback",
+  "/auth/signout",
+  "/api-docs",
 ];
 
 function matchesPublic(pathname: string) {
@@ -34,6 +42,23 @@ function matchesPublic(pathname: string) {
 }
 
 export async function middleware(request: NextRequest) {
+  // Middleware runs before every route. Anything it throws here becomes a 500
+  // on every page simultaneously, which is a spectacularly bad way to discover
+  // a missing environment variable. It fails open instead: if the session
+  // cannot be refreshed we let the request through, and the datastore banner
+  // reports the misconfiguration where a human will actually read it.
+  try {
+    return await handle(request);
+  } catch (error) {
+    console.error(
+      "[cream] middleware could not refresh the session, continuing without one:",
+      error instanceof Error ? error.message : error,
+    );
+    return NextResponse.next({ request });
+  }
+}
+
+async function handle(request: NextRequest) {
   const { pathname, search } = request.nextUrl;
 
   // Static assets never need a session.
@@ -46,14 +71,18 @@ export async function middleware(request: NextRequest) {
     return NextResponse.next({ request });
   }
 
-  if (!supabaseEnv.url || !supabaseEnv.anonKey) {
-    // Not configured: stay in seed mode and do not pretend otherwise.
+  const url = supabaseEnv.url;
+  const anonKey = supabaseEnv.anonKey;
+
+  if (!url || !anonKey) {
+    // Not configured, or baked in as empty at build time. Stay in seed mode
+    // and do not pretend otherwise.
     return NextResponse.next({ request });
   }
 
   let response = NextResponse.next({ request });
 
-  const supabase = createServerClient(process.env.NEXT_PUBLIC_SUPABASE_URL!.trim(), process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!.trim(), {
+  const supabase = createServerClient(url, anonKey, {
     cookies: {
       getAll() {
         return request.cookies.getAll();
@@ -76,17 +105,34 @@ export async function middleware(request: NextRequest) {
     },
   });
 
-  // Touching the user refreshes the token when it is near expiry.
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
+  // Touching the user refreshes the token when it is near expiry. A network
+  // failure here must not be fatal either — an unreachable identity provider
+  // should degrade to "nobody is signed in", not to a blank site.
+  let user = null;
+  try {
+    const { data, error } = await supabase.auth.getUser();
+    if (error) throw error;
+    user = data.user;
+  } catch (error) {
+    console.error(
+      "[cream] session lookup failed, treating the request as anonymous:",
+      error instanceof Error ? error.message : error,
+    );
+  }
 
   const isPublic = matchesPublic(pathname);
 
   if (!user && !isPublic) {
     const url = request.nextUrl.clone();
     url.pathname = "/auth/signin";
-    url.search = `?next=${encodeURIComponent(`${pathname}${search}`)}`;
+    // Belt and braces against a redirect loop. The route list already marks
+    // /auth/signin public, but if that list is ever edited incorrectly the
+    // failure mode is an ERR_TOO_MANY_REDIRECTS that bricks the whole site,
+    // and the nested `?next=` in the log is near-impossible to diagnose. Two
+    // independent guards against that outcome.
+    const alreadyRedirecting = pathname.startsWith("/auth/signin");
+    const carry = alreadyRedirecting ? "" : `?next=${encodeURIComponent(`${pathname}${search}`)}`;
+    url.search = carry;
     return NextResponse.redirect(url);
   }
 

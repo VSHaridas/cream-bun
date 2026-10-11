@@ -25,6 +25,24 @@ export function isSupabaseServerConfigured() {
   return Boolean(supabase.url && supabase.anonKey);
 }
 
+/**
+ * A project URL carrying a path — `/rest/v1` being the common one — produces
+ * `/rest/v1/rest/v1/...` and a 404 that names neither the cause nor the fix.
+ * We refuse it rather than constructing a client that cannot work.
+ */
+export function supabaseUrlProblem(): string | null {
+  if (!supabase.url || !supabase.anonKey) return null;
+  try {
+    const parsed = new URL(supabase.url);
+    if (parsed.pathname && parsed.pathname !== "/") {
+      return `NEXT_PUBLIC_SUPABASE_URL must be the bare project origin (https://<ref>.supabase.co) with no path. It currently has "${parsed.pathname}", which the client appends itself — every query would 404.`;
+    }
+  } catch {
+    return "NEXT_PUBLIC_SUPABASE_URL is not a valid URL.";
+  }
+  return null;
+}
+
 export function cookieOptions(): CookieOptions {
   return {
     path: "/",

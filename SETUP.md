@@ -24,6 +24,22 @@ app; all of it is required to run it against real infrastructure.
 | Project URL | `NEXT_PUBLIC_SUPABASE_URL` |
 | `anon` / `publishable` key | `NEXT_PUBLIC_SUPABASE_ANON_KEY` |
 
+> **The Project URL is the bare origin only** — `https://<ref>.supabase.co`, with
+> nothing after it.
+>
+> The dashboard shows the REST endpoint next to it, and copying the wrong one is
+> easy. If you set `NEXT_PUBLIC_SUPABASE_URL` to `.../rest/v1` the client
+> appends `/rest/v1` *again*, every request goes to
+> `/rest/v1/rest/v1/creators`, and every query returns a 404 with nothing in
+> the message pointing at the cause.
+>
+> The app normalises this automatically and reports that it did, but fix the
+> variable properly anyway. Check it with:
+>
+> ```bash
+> npm run check:url
+> ```
+
 **Dashboard → Project Settings → API Keys**
 
 | Field | Copy to |

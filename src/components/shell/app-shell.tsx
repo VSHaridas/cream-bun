@@ -1,6 +1,7 @@
 import { cn } from "@/lib/utils";
 import { capability } from "@/lib/env";
 import { getSupabaseServer } from "@/lib/supabase/server";
+import { getDatastoreStatus } from "@/lib/data";
 import { Header } from "./header";
 import { Footer } from "./footer";
 
@@ -46,6 +47,7 @@ async function resolveUser(): Promise<ShellUser | null> {
 
 export async function AppShell({ children }: { children: React.ReactNode }) {
   const user = await resolveUser();
+  const datastore = await getDatastoreStatus();
 
   const integrations = (["supabase", "gemini", "digilocker", "razorpay", "synthid"] as const).map((id) => {
     const c = capability(id);
@@ -71,8 +73,36 @@ export async function AppShell({ children }: { children: React.ReactNode }) {
         className="pointer-events-none fixed inset-x-0 top-0 -z-10 h-[42rem] bg-[radial-gradient(120%_80%_at_50%_-10%,color-mix(in_oklab,var(--caramel)_11%,transparent),transparent_62%)]"
       />
       <Header integrations={integrations} user={user} />
-      <main className={cn("flex-1")}>{children}</main>
+      <main className={cn("flex-1")}>
+        {datastore.degraded && <DatastoreBanner reason={datastore.reason} />}
+        {children}
+      </main>
       <Footer integrations={integrations} />
+    </div>
+  );
+}
+
+/**
+ * Loud degradation, not silent. If a configured database cannot be read the
+ * site falls back to the bundled dataset so it stays usable — but it says so,
+ * at the top, in the place a reviewer will see it.
+ */
+function DatastoreBanner({ reason }: { reason: string | null }) {
+  return (
+    <div className="border-b border-caramel/35 bg-caramel/[0.08]">
+      <div className="container-x flex flex-wrap items-center gap-x-3 gap-y-1 py-2.5">
+        <span className="inline-flex items-center gap-2 font-mono text-[10.5px] uppercase tracking-[0.12em] text-caramel">
+          <span className="size-1.5 animate-pulse rounded-full bg-caramel" />
+          datastore unavailable
+        </span>
+        <span className="text-[12.5px] text-ink-2">
+          Showing the bundled dataset. Has <code className="font-mono">0001_schema.sql</code> been
+          applied to the Supabase project?
+        </span>
+        {reason && (
+          <span className="font-mono text-[11px] text-ink-faint">server said: {reason}</span>
+        )}
+      </div>
     </div>
   );
 }
