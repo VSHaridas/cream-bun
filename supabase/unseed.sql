@@ -2,7 +2,7 @@
 --
 -- Generated alongside supabase/seed.sql. Reverses it exactly, by row.
 --
---   36 tables. 2026-10-11T03:36:01.211Z
+--   36 tables. 2026-10-11T04:42:03.196Z
 --
 -- SCOPED. Every delete names the specific seed rows, so accounts, briefs and
 -- offers created through the UI are left untouched. Only rows whose identifier

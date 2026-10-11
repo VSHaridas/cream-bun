@@ -12,7 +12,8 @@
  *
  *   npx tsx scripts/check-seed-sql.ts
  */
-import { readFileSync, existsSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { join } from "node:path";
 
 const ROOT = process.cwd();
@@ -302,6 +303,69 @@ for (const s of inserts) {
 }
 if (mismatched.length === 0) pass("every insert has as many values as columns");
 else fail(`column/value mismatch: ${mismatched.slice(0, 6).join("; ")}`);
+
+/* ── the generator's own guards must actually fire ───────────────────────── */
+
+// A check that cannot fail is not a check. `brands.industry` was the real bug
+// this run was written to prevent, so temporarily reintroduce it and confirm
+// the generator rejects the seed rather than emitting SQL that 23503s at the
+// database.
+const SEEDER = join(ROOT, "scripts", "seed.ts");
+const TSX_CLI = join(ROOT, "node_modules", "tsx", "dist", "cli.mjs");
+
+function generationFails(mutate: (src: string) => string, needle: string): boolean {
+  const original = readFileSync(SEEDER, "utf8");
+  const mutated = mutate(original);
+  if (mutated === original) {
+    fail(`could not apply the mutation used to test the generator's guard: ${needle}`);
+    return false;
+  }
+
+  writeFileSync(SEEDER, mutated, "utf8");
+  try {
+    // `npx` on Windows is a .cmd shim and does not forward stdio the way a
+    // direct exec does, so invoke tsx through node and take both streams.
+    execFileSync(process.execPath, [TSX_CLI, SEEDER, "--sql"], {
+      cwd: ROOT,
+      stdio: "pipe",
+      encoding: "utf8",
+    });
+    return false;
+  } catch (error) {
+    const result = error as { stdout?: string; stderr?: string };
+    const output = `${result.stdout ?? ""}${result.stderr ?? ""}`;
+    if (!output.includes(needle)) {
+      console.error(
+        `        generator said:\n${output.split("\n").slice(0, 6).map((l) => `          ${l}`).join("\n")}`,
+      );
+    }
+    return output.includes(needle);
+  } finally {
+    writeFileSync(SEEDER, original, "utf8");
+  }
+}
+
+const caughtBrandIndustry = generationFails(
+  (src) => src.replace("industry: slugify(b.industry)", "industry: String(b.industry)"),
+  "brands.industry references industries.id",
+);
+if (caughtBrandIndustry) {
+  pass("the foreign-key check catches a label written where a slug belongs");
+} else {
+  fail(
+    "the foreign-key check did not fire when brands.industry was reverted to the label",
+  );
+}
+
+const caughtPhantomColumn = generationFails(
+  (src) => src.replace("      w: a.w,", "      width: a.w,"),
+  "aspect_ratios: width",
+);
+if (caughtPhantomColumn) {
+  pass("the column check catches a field that is not in the schema");
+} else {
+  fail("the column check did not fire when aspect_ratios.width was restored");
+}
 
 console.log(
   failed === 0

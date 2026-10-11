@@ -355,7 +355,10 @@ async function main() {
       name: b.name,
       legal_name: b.legalName,
       kind: b.kind,
-      industry: b.industry,
+      // `industry` is a foreign key into `industries.id`, which is the slug of
+      // the label — not the label itself. The domain carries "Fashion"; the
+      // column needs "fashion". Same rewrite as specializations above.
+      industry: slugify(b.industry),
       logo_initials: b.logoInitials,
       accent: b.accent,
       location: b.location,
@@ -547,7 +550,7 @@ async function main() {
       year: p.year,
       client: p.client,
       client_logo_initials: p.clientLogoInitials ?? null,
-      industry: p.industry,
+      industry: slugify(p.industry),
       workflow_id: p.workflowId,
       palette: p.palette,
       art_seed: p.artSeed,
@@ -990,19 +993,54 @@ function elementTypeFor(table: string, column: string) {
  */
 const ARRAY_COLUMNS = new Set<string>();
 const TABLE_COLUMNS = new Map<string, Set<string>>();
+const SCHEMA_TABLES = new Map<string, { columns: Set<string>; foreignKeys: Fk[] }>();
 const SCHEMA_ENUMS = new Set<string>();
 
+interface Fk {
+  column: string;
+  parent: string;
+  /** The parent column this one points at. Usually `id`. */
+  parentColumn: string;
+}
+
 function readSchema(sql: string) {
+  // How each parent column is named. All text-keyed reference tables in this
+  // schema use `id`; the rest are addressed by slug.
+  const parentKeyColumn = (table: string) =>
+    ["models", "tools", "skills", "content_types", "aspect_ratios"].includes(table)
+      ? "id"
+      : "id";
+
   for (const match of sql.matchAll(
     /create table if not exists public\.(\w+) \(([\s\S]*?)\n\);/g,
   )) {
     const [, table, body] = match;
     const columns = new Set<string>();
     for (const line of body.split("\n")) {
-      const column = line.trim().match(/^(\w+)\s+(?:text|bigint|smallint|integer|numeric|boolean|uuid|jsonb|timestamptz|date|timestamp|vector\(\d+\)|tsvector|\w+(?:\[\])?)\b/);
+      const column = line
+        .trim()
+        .match(
+          /^(\w+)\s+(?:text|bigint|smallint|integer|numeric|boolean|uuid|jsonb|timestamptz|date|timestamp|vector\(\d+\)|tsvector|\w+(?:\[\])?)\b/,
+        );
       if (column) columns.add(column[1]);
     }
+
+    const foreignKeys: Fk[] = [];
+    for (const line of body.split("\n")) {
+      const fk = line.match(
+        /^\s+(\w+)\s+[\w\s(),]+\s+references\s+public\.(\w+)\s*\(\s*(\w+)\s*\)/,
+      );
+      if (fk) {
+        foreignKeys.push({
+          column: fk[1],
+          parent: fk[2],
+          parentColumn: parentKeyColumn(fk[2]),
+        });
+      }
+    }
+
     TABLE_COLUMNS.set(table, columns);
+    SCHEMA_TABLES.set(table, { columns, foreignKeys });
     for (const column of body.matchAll(/^\s+(\w+)\s+text\[\]/gm)) {
       ARRAY_COLUMNS.add(`${table}.${column[1]}`);
     }
@@ -1041,6 +1079,61 @@ function assertColumnsExist(table: string, rows: Record<string, unknown>[]) {
     problems.push(
       `${table}: ${[...unknown].sort().join(", ")}  (has: ${[...known].sort().join(", ")})`,
     );
+  }
+}
+
+/**
+ * Static check that every foreign key value actually resolves.
+ *
+ * The first run of this generator produced SQL that failed on the third
+ * statement: `brands.industry` is a foreign key into `industries.id`, but the
+ * row carried the human label ("Fashion") rather than the slug ("fashion").
+ * PostgREST rejects it; a pasted transaction rolls back with a message naming
+ * a constraint and nothing about the cause.
+ *
+ * Column existence is not enough — a column can be present and still hold a
+ * value the referenced table does not have. So this walks every declared
+ * foreign key and confirms the values we are about to insert are present in the
+ * parent table's own rows.
+ *
+ * Skipped for parents that are not text-keyed, where the join is on a uuid we
+ * only learn at insert time.
+ */
+function assertForeignKeysResolve(tables: SeedTable[]) {
+  const byTable = new Map(tables.map((t) => [t.table, t]));
+
+  for (const { table, rows } of tables) {
+    const schema = SCHEMA_TABLES.get(table);
+    if (!schema) continue;
+
+    for (const fk of schema.foreignKeys) {
+      const values = [
+        ...new Set(rows.map((r) => r[fk.column]).filter((v) => typeof v === "string" && v)),
+      ] as string[];
+      if (!values.length) continue;
+
+      const parent = byTable.get(fk.parent);
+      if (!parent) {
+        // Parent not in the seed (auth.users, profiles). Not checkable here.
+        continue;
+      }
+
+      const parentColumn = fk.parentColumn;
+      const parentKeys = parent.rows.map((r) => r[parentColumn]).filter(Boolean);
+      if (!parentKeys.length) continue;
+
+      // Only a text-to-text comparison is meaningful.
+      const known = new Set(parentKeys.map(String));
+      const missing = values.filter((v) => !known.has(v));
+      if (missing.length) {
+        problems.push(
+          `${table}.${fk.column} references ${fk.parent}.${parentColumn}, but these ` +
+            `values are not in the seed: ${missing.slice(0, 4).join(", ")}` +
+            `${missing.length > 4 ? ` (+${missing.length - 4} more)` : ""}. ` +
+            `Parent has: ${[...known].slice(0, 4).join(", ")}…`,
+        );
+      }
+    }
   }
 }
 
@@ -1354,6 +1447,7 @@ main()
     // Validate the whole plan before rendering. renderTable also reports, but
     // by then the file is half-written and the exit code has not been set.
     for (const entry of plan) assertColumnsExist(entry.table, entry.rows);
+    assertForeignKeysResolve(plan);
 
     if (problems.length) {
       console.error(`\n  ${problems.length} problem(s) between the seed and the schema:\n`);
