@@ -14,7 +14,9 @@
     "db:seed": "tsx scripts/seed.ts",
     "check:url": "tsx scripts/check-project-url.ts",
     "check:empty": "tsx scripts/check-empty-dataset.ts",
-    "check:export": "tsx scripts/check-brief-export.ts"
+    "check:export": "tsx scripts/check-brief-export.ts",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.scripts.json",
+    "check": "npm run typecheck && npm run lint && npm run check:url && npm run check:export && npm run build"
   },
   "dependencies": {
     "@google/genai": "^2.28.0",

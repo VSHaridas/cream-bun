@@ -19,7 +19,7 @@ const draft: BriefDraft = {
   styleTags: ["photoreal", "golden hour"],
   excludedStyles: ["stock-photo handshake"],
   referenceNotes: ["Ref: Apple product film 2025"],
-  contentTypes: ["film"],
+  contentTypes: ["cinematic-video"],
   aspectRatios: ["16:9"],
   targetChannels: ["instagram", "youtube"],
   budgetMinInr: 350000,
