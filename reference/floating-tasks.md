@@ -1,7 +1,7 @@
 # Floating tasks — CREAM
 
 Durable tracker. Todos come and go; this file is the record of why.
-Last updated: 2026-10-11, after first live Vercel deployment review.
+Last updated: 2026-10-11, after second review round.
 
 ---
 
@@ -13,48 +13,66 @@ Last updated: 2026-10-11, after first live Vercel deployment review.
 
 ## 0. Critical — live breakage found in deployment review
 
-### P0-1 · Pages 500 on an empty or unseeded datastore — `OPEN`
-**Found:** `/` → `artSeed`, `/trust` → `amountInr`, `/model` → `rounds`.
+### P0-1 · Pages 500 on an empty or unseeded datastore — `DONE`
+**Found:** `/` → `artSeed`, `/trust` → `amountInr`, `/model` → `rounds`, and
+`/deck` (same bug, not yet reported). Commit `14daf1f`.
 
-All three are the same bug. Pages index straight into the dataset and assume
-rows exist:
+All four indexed straight into the dataset and assumed rows existed:
+`escrows[0].amountInr`, `briefs[0]`, `engagements[0].rounds[1]`,
+`portfolio.find(...)!`. A non-null assertion is not a runtime check.
 
-- `src/app/page.tsx:40` — `portfolio.find(...)!`
-- `src/app/model/page.tsx:270-277` — `briefs[0]`, `creators[0]`, `engagements[0].rounds[1]`
-- `src/app/trust/page.tsx:541` — reads `amountInr` off a looked-up row
+Each page now declares the rows it needs and renders a named empty state that
+says which tables are empty and the command that fills them. Two index
+assumptions were fixed rather than guarded: `d3` is a seeded literal a
+user-created brief will never have, and `rounds[1]` presumes a second revision.
 
-A non-null assertion is not a runtime check. With Supabase connected but empty
-(migration applied, not seeded) every one of these dereferences `undefined`.
-
-**Accept when:** no page can 500 on an empty dataset. Either the pages render an
-explicit empty state, or the dataset is guaranteed populated. Both, ideally.
+**Verified:** `npm run check:empty` — all seven data pages 200 with the guard
+firing under `CREAM_FORCE_DATASET=empty`; all eight render real content under
+the seed.
 
 ---
 
-### P0-2 · `persist.createBrief` declared, never implemented, never called — `OPEN`
-**Found:** brief count stays 0; `brief_sessions` has no rows in Supabase.
+### P0-2 · `persist.createBrief` declared, never implemented, never called — `DONE`
+Commit `ea415fe`. Briefs now write to `brief_sessions` + `briefs` +
+`conversation_turns`, and the publish button reports what the server returned
+rather than asserting success.
 
-`src/lib/data/provider.ts:47` declares `persist.createBrief`. Nothing implements
-it. Nothing calls it. The brief builder is read-only — it renders a preview that
-goes nowhere.
-
-This also explains "the brief isn't being exported anywhere".
+Ownership resolves from the session, not the request body — `briefs.brand_id`
+is an RLS boundary and a client-supplied owner would undermine it.
 
 **Accept when:** creating a brief writes a row, it appears in `/briefs`, and it
-survives a reload. Export (PDF/Markdown/copy) works from that row.
+survives a reload. Export works from that row.
+**Still to verify against a live project:** the write itself. Locally verified
+by type and by render, not by round trip.
 
 ---
 
-### P0-3 · Every page load makes 30 queries, not 15 — `OPEN`
-**Found:** user reports 8s+ on every section.
+### P0-3 · Every page load makes 30 queries, not 15 — `DONE`
+`getDatastoreStatus` and `getSnapshot` each called `provider.load()`. React
+`cache()` memoises per function, not per underlying call, so the shell's status
+check and the page's data read each fired the full fifteen-table `Promise.all` —
+serially, because the shell awaits first. Commit `14daf1f`.
 
-`getDatastoreStatus()` calls `provider.load()`. `getSnapshot()` calls
-`provider.load()` again. React `cache()` memoises each function separately, so
-they do not share a result — the full 15-table `Promise.all` runs twice per
-request. `AppShell` calls the first, every page calls the second.
+Both now share one memoised `loadOnce`. **Needs a production measurement to
+confirm** the 8s is gone.
 
-**Accept when:** one load per request, verified by query count. Measured page
-load under 1s warm.
+---
+
+### P1-1 · Double datastore read — `DONE` (merged into P0-3)
+### P1-4 · `Auth session missing!` logged as an error on every anonymous request — `DONE`
+Correct behaviour, wrong log level. Commit `19aa361`.
+
+---
+
+### P2-1 · No onboarding after first sign-in — `DONE`
+Commit `19aa361`.
+
+`handle_new_user()` writes a usable-looking profile on first sign-in, so nothing
+that checked for *existence* saw an unfinished account. `getOnboardingState()`
+reads the *shape* instead: a creator needs a headline, bio, philosophy, day
+rate, a portfolio piece and a verification; a brand needs a legal entity name.
+Incomplete accounts land on `/onboarding`, configured ones go home. An explicit
+`next` still wins, and the state query degrades rather than failing the sign-in.
 
 ---
 
@@ -125,8 +143,11 @@ This is the largest single item. It is a feature build, not a bug fix.
 
 ## 4. Brief experience
 
-### P4-1 · No export, no shareable preview — `OPEN`
-Depends on P0-2.
+### P4-1 · No export, no shareable preview — `DONE` (export) / `OPEN` (shareable preview)
+Markdown and plain-text renderers in `src/lib/brief/export.ts`, reachable from
+the builder after a successful save, plus an "export anyway" path when the write
+fails. `npm run check:export` asserts the rendered document has substance.
+A shareable read-only preview URL is still open.
 ### P4-2 · Gemini output feels rigid and templated — `OPEN`
 User's own words: "it works, but it feels rigid". Low priority per user, but
 likely the system prompt over-constrains and normalises every answer. Needs
@@ -156,3 +177,18 @@ and also crashes on empty data (P0-1).
 - `DONE` · Next.js CVE → 15.5.27. Commit `a741ecc`.
 - `DONE` · Build-time `cookies()` outside request scope. All data routes now `force-dynamic`.
 - `DONE` · Repo hygiene: 1.1GB → ~290MB, `.gitignore` hardened, secrets purged from history.
+
+---
+
+## 7. Verification harness
+
+Dependency-free, because adding a test runner wants `@types/node` ≥22 and this
+project is on ^20. Each one fails the process on a bad result.
+
+| Command | Asserts |
+| --- | --- |
+| `npm run check:url` | Project URL normalises to a bare origin; `/rest/v1` and friends are stripped |
+| `npm run check:empty` | No page 500s under `CREAM_FORCE_DATASET=empty` |
+| `npm run check:export` | Brief export renders a document with substance, no `undefined` leakage |
+| `npm run build` + `npm run start` | Route table and static generation |
+| `npm run db:seed` | Idempotent upsert of the seed graph |
